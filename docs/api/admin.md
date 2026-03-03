@@ -1,0 +1,422 @@
+# Admin
+
+Admin-only endpoints for Stripe synchronization, data health, dashboard metrics, and reporting. All endpoints require a valid JWT with `role: admin`.
+
+The Dashboard and Reports endpoints are served by the separately deployed `lopc-admin` Cloudflare Worker at a distinct URL; Sync and Data-Health endpoints are part of the main `lopc-api` Worker.
+
+---
+
+## POST /admin/sync/stripe
+
+Bidirectional reconciliation between the local database and Stripe. Runs in phases to stay within Cloudflare's subrequest limits. The default `phase=all` runs all five steps sequentially.
+
+**Auth:** `admin`
+
+### Query Parameters
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `phase` | `string` | No | `all` (default), `stage`, `finalize`, or `status` |
+| `batchSize` | `number` | No | Number of staged orders to finalize per call (default `3`) |
+
+### Phases
+
+| Phase | Description |
+|---|---|
+| `all` | Stage Stripe charges **and** finalize in one call (may hit subrequest limits for large catalogs) |
+| `stage` | Import Stripe product/customer/charge data into local staging tables — no orders written yet |
+| `finalize` | Convert staged rows into `orders` + `order_lines` in bounded batches (safe to call repeatedly) |
+| `status` | Return backlog counts without any mutations |
+
+### Response `200` — `phase=all` or `phase=finalize`
+
+```json
+{
+  "data": {
+    "products": {
+      "imported": 3,
+      "created": 1,
+      "synced": 2,
+      "skipped": 0
+    },
+    "customers": {
+      "imported": 5,
+      "synced": 3,
+      "created": 2,
+      "skipped": 0
+    },
+    "orders": {
+      "staged": 10,
+      "finalized": 3,
+      "skipped": 7,
+      "failed": 0
+    }
+  }
+}
+```
+
+### Response `200` — `phase=status`
+
+```json
+{
+  "data": {
+    "pending": 7,
+    "finalized": 3,
+    "failed": 0,
+    "remainingToFinalize": 7
+  }
+}
+```
+
+#### Sync Steps (phase=all/stage)
+
+| Step | Description |
+|---|---|
+| 1 | Stripe active products → local DB (import missing, deduplicate slugs) |
+| 2 | Local products without Stripe IDs → Stripe (create Product + Price) |
+| 3 | Stripe customers → local DB (link `stripeCustomerId` for known emails, create guest rows for unknown) |
+| 4 | Local users without `stripeCustomerId` → Stripe (look up by email or create) |
+| 5 | Historical paid Stripe charges → `stripe_order_import_staging` table |
+
+#### Finalize step
+
+Reads rows from `stripe_order_import_staging` in batches. For each:
+- Looks up Stripe Checkout Session line items
+- Resolves or creates local product rows
+- Upserts shipping/billing addresses
+- Inserts `orders` + `order_lines`
+- Idempotent on `stripe_payment_intent_id`
+
+### Error Responses
+
+| Status | Code | Condition |
+|---|---|---|
+| 400 | `BAD_REQUEST` | Invalid `phase` value |
+| 500 | `SERVER_ERROR` | Unexpected error during sync |
+
+---
+
+## GET /admin/data-health
+
+Read-only diagnostic snapshot of database state. Returns orphan counts, duplicate address groups, and orders that may be stuck in a failed webhook loop.
+
+**Auth:** `admin`
+
+### Response `200`
+
+```json
+{
+  "data": {
+    "tableCounts": {
+      "users": 6,
+      "customers": 4,
+      "addresses": 6,
+      "orders": 10,
+      "orderLines": 11,
+      "processedWebhookEvents": 1,
+      "stripeOrderImportStaging": 0
+    },
+    "orphans": {
+      "orderLinesNoOrder": 0,
+      "shipmentsNoOrder": 0,
+      "ordersWithMissingAddress": 0,
+      "addressesUnreferencedByOrders": {
+        "count": 0,
+        "ids": []
+      }
+    },
+    "duplicates": {
+      "addressGroups": {
+        "count": 0,
+        "groups": []
+      }
+    },
+    "webhooks": {
+      "stuckOrders": {
+        "count": 10,
+        "items": [
+          {
+            "orderId": "uuid",
+            "paymentIntentId": "pi_...",
+            "sessionId": "cs_test_...",
+            "total": 36
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `tableCounts` | Row counts for every major table |
+| `orphans.orderLinesNoOrder` | Order lines whose parent order no longer exists |
+| `orphans.shipmentsNoOrder` | Shipments whose parent order no longer exists |
+| `orphans.ordersWithMissingAddress` | Orders referencing a non-existent address |
+| `orphans.addressesUnreferencedByOrders` | Addresses not referenced by any order (may be intentional) |
+| `duplicates.addressGroups` | Groups of identical addresses on the same customer |
+| `webhooks.stuckOrders` | Stripe-source orders without a `processed_webhook_events` row (Stripe retries will 500 until resolved) |
+
+---
+
+## POST /admin/data-health
+
+Mutation actions for resolving data-health issues. Specify the action via the `action` query parameter.
+
+**Auth:** `admin`
+
+### Query Parameters
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `action` | `string` | Yes | `purge-orphans`, `dedupe-addresses`, `mark-webhook-processed`, or `rollback-order` |
+| `eventId` | `string` | Conditional | Required when `action=mark-webhook-processed` |
+| `paymentIntentId` | `string` | Conditional | Required when `action=rollback-order` |
+
+---
+
+### action=purge-orphans
+
+Deletes all orphan rows in FK-safe order: `order_lines` → `shipments` → `orders` (missing address) → `addresses` (unreferenced) → `customers` (no orders, no addresses, not admin).
+
+#### Response `200`
+
+```json
+{
+  "data": {
+    "action": "purge-orphans",
+    "deleted": {
+      "orderLines": 2,
+      "shipments": 0,
+      "orders": 0,
+      "addresses": 3,
+      "customers": 1
+    }
+  }
+}
+```
+
+---
+
+### action=dedupe-addresses
+
+Removes exact duplicate address rows. For each duplicate group, the row referenced by an order is kept (or the lowest UUID if none are referenced). All others are deleted.
+
+#### Response `200`
+
+```json
+{
+  "data": {
+    "action": "dedupe-addresses",
+    "deleted": { "addresses": 2 },
+    "deletedIds": ["uuid-1", "uuid-2"]
+  }
+}
+```
+
+---
+
+### action=mark-webhook-processed
+
+Inserts a Stripe event ID into `processed_webhook_events` so Stripe stops retrying the event (which would otherwise cause a 500 because the order already exists via admin sync).
+
+#### Query Parameters
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `eventId` | `string` | Yes | Stripe event ID, e.g. `evt_1T6qXO5Rw...` |
+
+#### Response `200`
+
+```json
+{
+  "data": {
+    "action": "mark-webhook-processed",
+    "eventId": "evt_1T6qXO5Rw...",
+    "alreadyPresent": false,
+    "inserted": true
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `inserted` | `true` if the row was newly inserted |
+| `alreadyPresent` | `true` if the event was already recorded (idempotent) |
+
+#### Error Responses
+
+| Status | Code | Condition |
+|---|---|---|
+| 400 | `BAD_REQUEST` | Missing `eventId` |
+
+---
+
+### action=rollback-order
+
+Deletes an order and all its lines by `stripePaymentIntentId`. Also removes the related `processed_webhook_events` row and `stripe_order_import_staging` row so the order can be cleanly re-imported by resending the Stripe event.
+
+#### Query Parameters
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `paymentIntentId` | `string` | Yes | Stripe Payment Intent ID, e.g. `pi_3T6qXN5Rw...` |
+
+#### Response `200`
+
+```json
+{
+  "data": {
+    "action": "rollback-order",
+    "paymentIntentId": "pi_3T6qXN5Rw...",
+    "orderId": "uuid",
+    "deleted": {
+      "order": true,
+      "orderLines": true,
+      "stagingRow": true,
+      "processedWebhookEvent": true
+    },
+    "note": "Order and lines removed. You may now resend the Stripe webhook event to recreate this order."
+  }
+}
+```
+
+#### Error Responses
+
+| Status | Code | Condition |
+|---|---|---|
+| 400 | `BAD_REQUEST` | Missing `paymentIntentId`, or no order found for that ID |
+
+---
+
+## GET /admin/dashboard
+
+Returns today's summary metrics. Served by the `lopc-admin` Worker.
+
+**Auth:** `admin`
+
+### Response `200`
+
+```json
+{
+  "data": {
+    "ordersToday": 3,
+    "revenueToday": 147.50,
+    "newCustomersToday": 1,
+    "lowStockProducts": [
+      { "id": "uuid", "name": "Widget Pro", "stock": 2 }
+    ]
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `ordersToday` | `number` | Orders created today (UTC) |
+| `revenueToday` | `number` | Sum of `total` for non-cancelled/non-refunded orders today |
+| `newCustomersToday` | `number` | New customer rows created today |
+| `lowStockProducts` | `array` | Products with `stock < 10` (up to 20 results) |
+
+---
+
+## GET /admin/reports/sales
+
+Daily revenue breakdown for a date range. Excludes cancelled and refunded orders.
+
+**Auth:** `admin`
+
+### Query Parameters
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `from` | `string` | Yes | Start date, `YYYY-MM-DD` |
+| `to` | `string` | Yes | End date, `YYYY-MM-DD` (inclusive) |
+
+### Response `200`
+
+```json
+{
+  "data": {
+    "from": "2025-01-01",
+    "to": "2025-01-31",
+    "totalOrders": 42,
+    "totalRevenue": 2199.58,
+    "avgOrderValue": 52.37,
+    "daily": [
+      { "date": "2025-01-01", "totalOrders": 3, "revenue": 149.97 }
+    ]
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `totalOrders` | `number` | Orders in the range |
+| `totalRevenue` | `number` | Sum of `total` in range |
+| `avgOrderValue` | `number` | `totalRevenue / totalOrders` |
+| `daily` | `array` | Day-by-day breakdown |
+
+### Error Responses
+
+| Status | Code | Condition |
+|---|---|---|
+| 400 | `BAD_REQUEST` | Missing `from` or `to` |
+
+---
+
+## GET /admin/reports/inventory
+
+Full product catalog with variants and stock levels.
+
+**Auth:** `admin`
+
+### Response `200`
+
+```json
+{
+  "data": [
+    {
+      "id": "uuid",
+      "name": "Widget Pro",
+      "slug": "widget-pro",
+      "price": 49.99,
+      "stock": 8,
+      "status": "active",
+      "variants": [
+        { "id": "uuid", "sku": "WP-L", "name": "Size: L", "stock": 3 }
+      ]
+    }
+  ]
+}
+```
+
+All product fields plus a `variants` array. See [products.md](./products.md) for full field definitions.
+
+---
+
+## GET /admin/reports/customers
+
+Customer acquisition and activity summary.
+
+**Auth:** `admin`
+
+### Response `200`
+
+```json
+{
+  "data": {
+    "totalActive": 24,
+    "totalInactive": 2,
+    "newPerDay": [
+      { "date": "2025-01-01", "count": 3 }
+    ]
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `totalActive` | `number` | Users with `role = 'customer'` |
+| `totalInactive` | `number` | Users with `role = 'inactive'` |
+| `newPerDay` | `array` | New customer counts per day for the last 30 days |

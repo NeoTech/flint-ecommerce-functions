@@ -1,0 +1,5 @@
+[test]
+# E2E tests are guarded by E2E=1 env var and only run via `bun run e2e`.
+# plain `bun test` will discover test/e2e/smoke.test.ts but skip it immediately
+# because RUN_E2E evaluates to false without the env var.
+

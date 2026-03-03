@@ -1,0 +1,14 @@
+.env
+.dev.vars
+node_modules
+dist
+.local.commands
+scripts/**
+
+# Local SQLite database files
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Lock files
+*.lock

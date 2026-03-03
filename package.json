@@ -1,0 +1,41 @@
+{
+  "name": "lopc-api",
+  "version": "0.1.0",
+  "description": "Logistics-Orders-Products-Customers serverless API",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev:bun": "bun --env-file .dev.vars src/platforms/bun-dev.ts",
+    "build": "bun build src/platforms/cloudflare.ts --target=browser --outdir=dist",
+    "test": "bun test",
+    "test:coverage": "bun test --coverage",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write .",
+    "deploy:cf": "wrangler deploy",
+    "deploy:vercel": "vercel --prod",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:studio": "drizzle-kit studio",
+    "db:seed": "bun run src/db/seed.ts",
+    "gen-keys": "bun run scripts/gen-keys.ts",
+    "e2e": "E2E=1 bun test test/e2e/"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.14.0",
+    "@types/bcryptjs": "^3.0.0",
+    "bcryptjs": "^3.0.3",
+    "drizzle-orm": "^0.44.0",
+    "jose": "^5.10.0",
+    "stripe": "^20.4.0",
+    "urlpattern-polyfill": "^10.0.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.0",
+    "@cloudflare/workers-types": "^4.20250214.0",
+    "drizzle-kit": "^0.30.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^3.109.0"
+  }
+}

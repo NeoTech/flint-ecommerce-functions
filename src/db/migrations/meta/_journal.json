@@ -1,0 +1,48 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1772475168063,
+      "tag": "0000_marvelous_madripoor",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1772476379870,
+      "tag": "0001_jittery_mole_man",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1772476731454,
+      "tag": "0002_absurd_blur",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1772486061883,
+      "tag": "0003_lean_radioactive_man",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1772487061883,
+      "tag": "0004_candid_placeholder_address",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1772488061883,
+      "tag": "0005_two_phase_stripe_import",
+      "breakpoints": true
+    }
+  ]
+}

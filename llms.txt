@@ -1,0 +1,181 @@
+# LOPC API
+
+> E-commerce REST API built on Cloudflare Workers (Bun + TypeScript). Handles products, categories, customers, orders, shipments, Stripe sync, and webhook fulfillment.
+
+Base URL: `https://lopc-api.andreas-016.workers.dev`
+Admin Worker (dashboard + reports): separate Cloudflare Worker deployment at the same subdomain prefix, serving `/admin/dashboard` and `/admin/reports/*`.
+
+## Docs
+
+- [API Index](docs/api/README.md)
+- [Auth](docs/api/auth.md)
+- [Products](docs/api/products.md)
+- [Categories](docs/api/categories.md)
+- [Customers](docs/api/customers.md)
+- [Orders](docs/api/orders.md)
+- [Logistics](docs/api/logistics.md)
+- [Admin](docs/api/admin.md)
+- [Webhooks](docs/api/webhooks.md)
+- [Discovery](docs/api/discovery.md)
+- [Database Schema](docs/schema.md)
+
+## Authentication
+
+All authenticated endpoints require:
+
+```
+Authorization: Bearer <accessToken>
+```
+
+Access tokens are RS256 JWTs with a 15-minute TTL. Refresh tokens are 7-day opaque tokens rotated on every use.
+
+| Auth level | Who can call |
+|---|---|
+| `none` | Anyone, no token needed |
+| `customer` | Valid JWT with role `customer` or `admin` |
+| `admin` | Valid JWT with role `admin` only |
+
+## Response Envelope
+
+Every response has the same shape:
+
+```json
+{
+  "data": <payload or null>,
+  "meta": { "page": 1, "pageSize": 20, "total": 100 },
+  "error": { "code": "ERROR_CODE", "message": "description" }
+}
+```
+
+On success `error` is `null`. On failure `data` is `null`. `meta` is only non-null for paginated list endpoints.
+
+## Pagination
+
+List endpoints accept `page` (default `1`) and `pageSize` (default `20`) query parameters.
+
+## HTTP Status Codes
+
+| Status | Meaning |
+|---|---|
+| 200 | Success |
+| 201 | Created |
+| 204 | No content (delete / logout) |
+| 400 | Bad request / missing parameters |
+| 401 | Missing or invalid token |
+| 403 | Authenticated but insufficient role |
+| 404 | Resource not found |
+| 409 | Conflict (duplicate slug, email, tracking number) |
+| 422 | Validation failed |
+| 500 | Internal server error |
+
+---
+
+## Endpoint Reference
+
+### Discovery
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/` | none | Runtime route manifest — all registered routes with method, path, auth level, description |
+
+### Auth
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| POST | `/auth/register` | none | Create account. Body: `email`, `password`, `firstName`, `lastName`, `phone?`. Returns `accessToken` + `refreshToken`. |
+| POST | `/auth/login` | none | Sign in. Body: `email`, `password`. Returns `accessToken` + `refreshToken`. |
+| POST | `/auth/logout` | customer | Revoke current refresh token. Body: `refreshToken`. |
+| POST | `/auth/refresh` | none | Exchange a valid refresh token for a new access + refresh token pair. Body: `refreshToken`. |
+| POST | `/auth/forgot-password` | none | Send password-reset email. Body: `email`. Always returns 200 to prevent email enumeration. |
+| POST | `/auth/reset-password` | none | Consume reset token and set new password. Body: `token`, `password`. |
+
+### Products
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/products` | none | List products. Query: `category`, `minPrice`, `maxPrice`, `search`, `inStock`, `status`, `page`, `pageSize`. |
+| GET | `/products/:id` | none | Single product with variants. |
+| POST | `/products` | admin | Create product. Body: `name`, `description?`, `price`, `comparePrice?`, `stock?`, `status?`, `categoryId?`. Slug auto-generated. Synced to Stripe (non-fatal on failure). |
+| PUT | `/products/:id` | admin | Update product fields (all optional). |
+| DELETE | `/products/:id` | admin | Soft-delete (status → `archived`). |
+| GET | `/products/:id/variants` | none | List variants for a product. |
+| POST | `/products/:id/variants` | admin | Create variant. Body: `sku`, `name`, `price?`, `stock?`, `attributes?`. |
+| PUT | `/products/:id/variants/:variantId` | admin | Update variant (all fields optional). |
+
+### Categories
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/categories` | none | List all categories. |
+| GET | `/categories/:id` | none | Single category. |
+| POST | `/categories` | admin | Create category. Body: `name`, `description?`, `parentId?`, `sortOrder?`. |
+| PUT | `/categories/:id` | admin | Update category (all fields optional). |
+| DELETE | `/categories/:id` | admin | Delete category. Returns 409 if active products are linked. |
+
+### Customers
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/customers` | admin | List customers with pagination. |
+| GET | `/customers/:id` | customer | Get profile. Customer may only access their own; admins can access any. |
+| PUT | `/customers/:id` | customer | Update name / phone. Self-or-admin. |
+| DELETE | `/customers/:id` | admin | Deactivate (sets role to `inactive`). |
+| GET | `/customers/:id/orders` | customer | List orders for this customer. Self-or-admin. |
+| GET | `/customers/:id/addresses` | customer | List saved addresses. Self-or-admin. |
+| POST | `/customers/:id/addresses` | customer | Add address. Body: `type` (`shipping`/`billing`), `street`, `city`, `state?`, `postalCode`, `country?`, `isDefault?`. |
+| PUT | `/customers/:id/addresses/:addressId` | customer | Update address fields (all optional). |
+| DELETE | `/customers/:id/addresses/:addressId` | customer | Remove address. |
+
+### Orders
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/orders` | customer | List orders. Customers see only their own. Admins can filter by `status`, `customerId`, `from`, `to`. |
+| GET | `/orders/:id` | customer | Single order with line items and shipments. |
+| POST | `/orders` | customer | Create order. Body: `lines[]` (`productId`, `variantId?`, `quantity`), `shippingAddressId`, `notes?`. Stock decremented atomically. |
+| PUT | `/orders/:id/status` | admin | Advance order status. Valid transitions: `pending→confirmed/cancelled`, `confirmed→processing/cancelled`, `processing→shipped/cancelled`, `shipped→delivered`, `delivered→refunded`. |
+| DELETE | `/orders/:id` | customer | Cancel order. Admins cancel any `pending/confirmed/processing` order; customers cancel their own `pending` orders within 30 minutes. Stock restored atomically. |
+| POST | `/orders/:id/refund` | admin | Apply partial or full refund. Body: `amount`, `reason`. When `refundedAmount >= subtotal` status becomes `refunded`. |
+
+### Logistics
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/logistics/shipments` | admin | List shipments. Query: `orderId`, `status`, `carrier`, `page`, `pageSize`. |
+| GET | `/logistics/shipments/:id` | customer | Single shipment. Customer must own the related order. |
+| POST | `/logistics/shipments` | admin | Create shipment. Body: `orderId`, `carrier`, `trackingNumber`, `status?`. Automatically advances order to `shipped`. |
+| PUT | `/logistics/shipments/:id` | admin | Update shipment. Setting `status: delivered` advances order to `delivered`. |
+| GET | `/logistics/tracking/:trackingNumber` | none | Public tracking lookup. Returns `carrier`, `status`, `shippedAt`, `deliveredAt` only. |
+
+### Admin
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| POST | `/admin/sync/stripe` | admin | Bidirectional Stripe reconciliation. Query: `phase` (`all`/`stage`/`finalize`/`status`), `batchSize?`. |
+| GET | `/admin/data-health` | admin | Read-only diagnostic: table counts, orphan rows, duplicate addresses, stuck webhook orders. |
+| POST | `/admin/data-health?action=purge-orphans` | admin | Delete orphan rows in FK-safe order. |
+| POST | `/admin/data-health?action=dedupe-addresses` | admin | Remove exact duplicate address rows, keeping the one referenced by an order. |
+| POST | `/admin/data-health?action=mark-webhook-processed` | admin | Insert Stripe event ID into `processed_webhook_events` to stop Stripe retries. Query: `eventId`. |
+| POST | `/admin/data-health?action=rollback-order` | admin | Delete order + lines by payment intent, clear staging + processed-webhook rows for clean re-import. Query: `paymentIntentId`. |
+| GET | `/admin/dashboard` | admin | Today's summary: `ordersToday`, `revenueToday`, `newCustomersToday`, `lowStockProducts`. |
+| GET | `/admin/reports/sales` | admin | Daily revenue breakdown. Query: `from` (YYYY-MM-DD), `to` (YYYY-MM-DD, inclusive). |
+| GET | `/admin/reports/inventory` | admin | Full product + variant list with stock levels. |
+| GET | `/admin/reports/customers` | admin | `totalActive`, `totalInactive`, `newPerDay` (last 30 days). |
+
+### Webhooks
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| POST | `/webhooks/stripe` | none (Stripe HMAC) | Stripe event ingestion. Handles `checkout.session.completed` and `checkout.session.async_payment_succeeded`. Idempotent via `processed_webhook_events`. |
+
+---
+
+## Key Behaviours
+
+- **Stock management**: decremented atomically on order creation; restored on cancellation.
+- **Stripe sync**: products and customers are synced bidirectionally via `POST /admin/sync/stripe`. Stripe product/price IDs are stored on local rows after first sync.
+- **Webhook idempotency**: every Stripe event is recorded in `processed_webhook_events`. Duplicate deliveries are silently ignored.
+- **Order source**: `source` field is `api` for orders created through the API and `stripe_import` for orders imported from historical Stripe charges.
+- **Soft delete**: products are archived (`status → archived`), not hard-deleted.
+- **JWT rotation**: refresh tokens are single-use and rotated on every `/auth/refresh` call.
+- **Placeholder address**: a system sentinel (`id = 00000000-0000-0000-0000-00000000a003`) exists for imported orders with no resolvable address.

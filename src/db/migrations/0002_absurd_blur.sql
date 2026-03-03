@@ -1,0 +1,1 @@
+ALTER TABLE `refresh_tokens` ADD `type` text DEFAULT 'refresh' NOT NULL;
