@@ -6,11 +6,12 @@
  * Useful when Stripe data has drifted (e.g. products imported directly into
  * Stripe, customer IDs missing from local rows, etc.).
  */
-import { eq, inArray } from 'drizzle-orm';
+import { asc, eq, inArray, sql } from 'drizzle-orm';
 import { registerRoute } from '../router.js';
 import { getDb } from '../db/client.js';
-import { addresses, customers, orders, products, stripeOrderImportStaging, users } from '../db/schema.js';
+import { addresses, customers, orders, products, stripeOrderImportStaging, syncCursors, users } from '../db/schema.js';
 import { getStripe } from '../lib/stripe.js';
+import { mapStripeProductStatus } from '../lib/stripe-product-status.js';
 import { badRequest, ok, serverError } from '../types.js';
 import type Stripe from 'stripe';
 
@@ -18,8 +19,7 @@ const PLACEHOLDER_USER_ID = '00000000-0000-0000-0000-00000000a001';
 const PLACEHOLDER_CUSTOMER_ID = '00000000-0000-0000-0000-00000000a002';
 const PLACEHOLDER_ADDRESS_ID = '00000000-0000-0000-0000-00000000a003';
 const PLACEHOLDER_EMAIL = 'system+missing-address@local.invalid';
-const FINALIZE_BATCH_SIZE = 3;
-const STAGE_PAGE_LIMIT = 1;
+const FINALIZE_BATCH_SIZE = 10;
 
 type RawClient = {
   execute: (input: { sql: string; args?: unknown[] } | string) => Promise<unknown>;
@@ -74,12 +74,12 @@ async function insertOrderLinesFromStripeSession(
   paymentIntentId: string,
   orderId: string,
   knownSessionId?: string | null,
-): Promise<void> {
+): Promise<number> {
   let sessionId = knownSessionId ?? null;
   if (!sessionId) {
     const sessions = await stripe.checkout.sessions.list({ payment_intent: paymentIntentId, limit: 1 });
     const session = sessions.data[0];
-    if (!session) return;
+    if (!session) return 0;
     sessionId = session.id;
   }
 
@@ -88,6 +88,7 @@ async function insertOrderLinesFromStripeSession(
     expand: ['data.price.product'],
   });
 
+  let insertedCount = 0;
   for (const item of lineItems.data) {
     const stripePriceId = item.price?.id ?? null;
     const stripeProductId =
@@ -108,33 +109,18 @@ async function insertOrderLinesFromStripeSession(
 
     let productId = productRow.rows?.[0]?.[0];
     if (!productId) {
-      const expandedProduct = item.price?.product as Stripe.Product | null;
-      const productName = expandedProduct?.name ?? stripeProductId;
-      const productDescription = expandedProduct?.description ?? null;
-      const baseSlug = productName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'stripe-product';
-      const slug = `${baseSlug}-${crypto.randomUUID().slice(0, 8)}`;
-
-      await rawClient.execute({
-        sql: `INSERT INTO products (id, category_id, name, slug, description, price, compare_price, stock, status, stripe_product_id, stripe_price_id, created_at, updated_at)
-              VALUES (?, NULL, ?, ?, ?, ?, NULL, 0, 'active', ?, ?, datetime('now'), datetime('now'))`,
-        args: [crypto.randomUUID(), productName, slug, productDescription, unitPrice, stripeProductId, stripePriceId],
-      });
-
-      const productRowAfterInsert = await rawClient.execute({
-        sql: 'SELECT id FROM products WHERE stripe_product_id = ? LIMIT 1',
-        args: [stripeProductId],
-      }) as { rows?: unknown[][] };
-      productId = productRowAfterInsert.rows?.[0]?.[0];
+      console.warn(`[admin-sync] Line item references unknown product ${stripeProductId}, skipping`);
+      continue;
     }
-
-    if (!productId) continue;
 
     await rawClient.execute({
       sql: `INSERT INTO order_lines (id, order_id, product_id, variant_id, quantity, unit_price, line_total, stripe_price_id)
             VALUES (?, ?, ?, NULL, ?, ?, ?, ?)`,
       args: [crypto.randomUUID(), orderId, String(productId), quantity, unitPrice, lineTotal, stripePriceId],
     });
+    insertedCount++;
   }
+  return insertedCount;
 }
 
 function toSlug(name: string): string {
@@ -301,7 +287,7 @@ registerRoute({
     const rawClient = (db as unknown as { $client: RawClient }).$client;
     const stripe = getStripe(ctx.env);
 
-    const productStats = { imported: 0, created: 0, synced: 0, upToDate: 0 };
+    const productStats = { imported: 0, created: 0, synced: 0, upToDate: 0, archived: 0, importedArchived: 0 };
     const customerStats = { imported: 0, synced: 0, created: 0, upToDate: 0 };
     const orderStats = { staged: 0, finalized: 0, skipped: 0, failed: 0 };
       const orderSkipReasons: {
@@ -326,26 +312,27 @@ registerRoute({
     }
 
     const phase = phaseParam as 'all' | 'catalog' | 'stage' | 'finalize' | 'status';
-    const finalizeBatchRaw = Number(url.searchParams.get('finalizeBatch') ?? String(FINALIZE_BATCH_SIZE));
-    const finalizeBatch = Number.isFinite(finalizeBatchRaw)
-      ? Math.min(50, Math.max(1, Math.floor(finalizeBatchRaw)))
+    const batchSizeRaw = Number(url.searchParams.get('batchSize') ?? url.searchParams.get('finalizeBatch') ?? String(FINALIZE_BATCH_SIZE));
+    const finalizeBatch = Number.isFinite(batchSizeRaw)
+      ? Math.min(50, Math.max(1, Math.floor(batchSizeRaw)))
       : FINALIZE_BATCH_SIZE;
-    const stagePageLimitRaw = Number(url.searchParams.get('stagePages') ?? String(STAGE_PAGE_LIMIT));
-    const stagePageLimit = Number.isFinite(stagePageLimitRaw)
-      ? Math.min(10, Math.max(1, Math.floor(stagePageLimitRaw)))
-      : STAGE_PAGE_LIMIT;
-    const stageCursor = url.searchParams.get('stageCursor') || undefined;
 
     if (phase === 'status') {
       const stagingStatuses = await db
-        .select({ status: stripeOrderImportStaging.status })
+        .select({ status: stripeOrderImportStaging.status, claimedAt: stripeOrderImportStaging.claimedAt })
         .from(stripeOrderImportStaging);
 
-      const backlog = { pending: 0, failed: 0, finalized: 0 };
+      const now = Date.now();
+      const fiveMinMs = 5 * 60 * 1000;
+      const backlog = { pending: 0, failed: 0, finalized: 0, staleProcessing: 0 };
       for (const row of stagingStatuses) {
         if (row.status === 'pending') backlog.pending++;
-        if (row.status === 'failed') backlog.failed++;
-        if (row.status === 'finalized') backlog.finalized++;
+        else if (row.status === 'failed') backlog.failed++;
+        else if (row.status === 'finalized') backlog.finalized++;
+        else if (row.status === 'processing') {
+          const claimedMs = row.claimedAt ? new Date(row.claimedAt).getTime() : 0;
+          if (now - claimedMs > fiveMinMs) backlog.staleProcessing++;
+        }
       }
 
       return ok({
@@ -355,7 +342,7 @@ registerRoute({
         orders: {
           ...orderStats,
           backlog,
-          remainingToFinalize: backlog.pending + backlog.failed,
+          remainingToFinalize: backlog.pending + backlog.failed + backlog.staleProcessing,
         },
       });
     }
@@ -366,11 +353,12 @@ registerRoute({
 
     if (runCatalogSync) {
 
+    // Build a set of stripeProductIds already known locally (shared by Step 1 & 1b).
+    const localProducts = await db.select().from(products);
+    const knownStripeIds = new Set(localProducts.map((p) => p.stripeProductId).filter(Boolean));
+
     // ---- Step 1: Import Stripe products that are missing from local DB ------
     try {
-      // Build a set of stripeProductIds already known locally.
-      const localProducts = await db.select().from(products);
-      const knownStripeIds = new Set(localProducts.map((p) => p.stripeProductId).filter(Boolean));
 
       // Page through all active Stripe products.
       let hasMore = true;
@@ -407,7 +395,7 @@ registerRoute({
             description: sp.description ?? null,
             price,
             stock: 0,
-            status: 'active',
+            status: mapStripeProductStatus(sp),
             stripeProductId: sp.id,
             stripePriceId: stripePrice.id,
           });
@@ -422,6 +410,68 @@ registerRoute({
     } catch (err) {
       console.error('[admin-sync] Stripe → local product import error:', err);
       return serverError('Product import from Stripe failed');
+    }
+
+    // ---- Step 1b: Import/archive inactive Stripe products -------------------
+    try {
+      let hasMore = true;
+      let startingAfter: string | undefined;
+
+      while (hasMore) {
+        const page = await stripe.products.list({
+          active: false,
+          limit: 100,
+          ...(startingAfter ? { starting_after: startingAfter } : {}),
+        });
+
+        for (const sp of page.data) {
+          if (knownStripeIds.has(sp.id)) {
+            // Product exists locally — archive if not already.
+            const localRow = (await db.select().from(products).where(eq(products.stripeProductId, sp.id)))[0];
+            if (localRow && localRow.status !== 'archived') {
+              await db.update(products)
+                .set({ status: 'archived', updatedAt: sql`(datetime('now'))` })
+                .where(eq(products.stripeProductId, sp.id));
+              productStats.archived++;
+            }
+            continue;
+          }
+
+          // Not known locally — import as archived.
+          const expandedDefaultPrice =
+            typeof sp.default_price === 'object' && sp.default_price
+              ? sp.default_price
+              : null;
+
+          const stripePrice = expandedDefaultPrice && expandedDefaultPrice.unit_amount !== null
+            ? expandedDefaultPrice
+            : (await stripe.prices.list({ product: sp.id, limit: 1 })).data[0];
+          if (!stripePrice || stripePrice.unit_amount === null) continue;
+
+          const price = stripePrice.unit_amount / 100;
+          const slug = await uniqueSlug(toSlug(sp.name), db);
+
+          await db.insert(products).values({
+            name: sp.name,
+            slug,
+            description: sp.description ?? null,
+            price,
+            stock: 0,
+            status: 'archived',
+            stripeProductId: sp.id,
+            stripePriceId: stripePrice.id,
+          });
+
+          knownStripeIds.add(sp.id);
+          productStats.importedArchived++;
+        }
+
+        hasMore = page.has_more;
+        startingAfter = page.data[page.data.length - 1]?.id;
+      }
+    } catch (err) {
+      console.error('[admin-sync] Stripe → local inactive product import error:', err);
+      return serverError('Inactive product import from Stripe failed');
     }
 
     // ---- Step 2: Push local products that lack Stripe IDs → Stripe ----------
@@ -569,18 +619,24 @@ registerRoute({
     try {
       const placeholders = await ensurePlaceholderRecords(db);
 
-      let nextStageCursor: string | null = null;
+      let lastProcessedChargeId: string | undefined;
       if (runStage) {
-        const knownPaymentIntents = new Set(
-          (await db.select({ piId: orders.stripePaymentIntentId }).from(orders))
-            .map((o) => o.piId)
-            .filter(Boolean),
-        );
+        const knownPaymentIntents = new Set<string>();
+        // From orders table
+        const orderPIs = await db.select({ piId: orders.stripePaymentIntentId }).from(orders);
+        for (const o of orderPIs) {
+          if (o.piId) knownPaymentIntents.add(o.piId);
+        }
+        // From staging table (already staged, don't re-upsert)
+        const stagedPIs = await db.select({ piId: stripeOrderImportStaging.stripePaymentIntentId }).from(stripeOrderImportStaging);
+        for (const s of stagedPIs) {
+          if (s.piId) knownPaymentIntents.add(s.piId);
+        }
 
+        const cursorRow = await db.select().from(syncCursors).where(eq(syncCursors.id, 'stripe_charges'));
+        let startingAfter: string | undefined = cursorRow[0]?.cursorValue ?? undefined;
         let hasMore = true;
-        let startingAfter = stageCursor;
-        let pagesProcessed = 0;
-        while (hasMore && pagesProcessed < stagePageLimit) {
+        while (hasMore) {
           const page = await stripe.charges.list({
             limit: 100,
             ...(startingAfter ? { starting_after: startingAfter } : {}),
@@ -640,7 +696,7 @@ registerRoute({
                         amount = excluded.amount,
                         amount_refunded = excluded.amount_refunded,
                         refunded = excluded.refunded,
-                        status = 'pending',
+                        status = CASE WHEN stripe_order_import_staging.status IN ('finalized') THEN stripe_order_import_staging.status ELSE 'pending' END,
                         updated_at = datetime('now')`,
                 args: [
                   crypto.randomUUID(),
@@ -661,11 +717,22 @@ registerRoute({
           }
 
           hasMore = page.has_more;
-          startingAfter = page.data[page.data.length - 1]?.id;
-          pagesProcessed++;
+          const lastPageChargeId = page.data[page.data.length - 1]?.id;
+          if (lastPageChargeId) lastProcessedChargeId = lastPageChargeId;
+          startingAfter = lastPageChargeId;
         }
 
-        nextStageCursor = hasMore ? (startingAfter ?? null) : null;
+        if (lastProcessedChargeId) {
+          await db.insert(syncCursors).values({
+            id: 'stripe_charges',
+            cursorType: 'charges',
+            cursorValue: lastProcessedChargeId,
+            updatedAt: new Date().toISOString(),
+          }).onConflictDoUpdate({
+            target: syncCursors.id,
+            set: { cursorValue: lastProcessedChargeId, updatedAt: new Date().toISOString() },
+          });
+        }
       }
 
       if (runFinalize) {
@@ -679,11 +746,25 @@ registerRoute({
         const usersByEmail = new Map(localUsers.map((u) => [u.email, u]));
         const customersByUserId = new Map(localCustomers.map((c) => [c.userId, c]));
 
+        const claimId = crypto.randomUUID();
+        await rawClient.execute({
+          sql: `UPDATE stripe_order_import_staging
+                SET status = 'processing', claimed_at = datetime('now'), claimed_by = ?
+                WHERE id IN (
+                  SELECT id FROM stripe_order_import_staging
+                  WHERE (
+                    status IN ('pending', 'failed')
+                    OR (status = 'processing' AND claimed_at < datetime('now', '-5 minutes'))
+                  )
+                  ORDER BY created_at ASC, id ASC
+                  LIMIT ?
+                )`,
+          args: [claimId, finalizeBatch],
+        });
         const stagedRows = await db
           .select()
           .from(stripeOrderImportStaging)
-          .where(inArray(stripeOrderImportStaging.status, ['pending', 'failed']))
-          .limit(finalizeBatch);
+          .where(eq(stripeOrderImportStaging.claimedBy, claimId));
 
         for (const staged of stagedRows) {
           try {
@@ -733,6 +814,11 @@ registerRoute({
 
             const newOrderId = crypto.randomUUID();
 
+            const orderStatus = (staged.refunded === 1 && staged.amountRefunded >= staged.amount) ? 'refunded' : 'confirmed';
+            const orderNotes = staged.refunded === 1
+              ? (staged.amountRefunded >= staged.amount ? 'fully refunded' : 'partially refunded')
+              : null;
+
             await withRetry(
               () => rawClient.execute({
                 sql: `INSERT INTO orders (
@@ -755,7 +841,7 @@ registerRoute({
                       ) VALUES (
                         ?,
                         ?,
-                        'confirmed',
+                        ?,
                         ?,
                         0,
                         0,
@@ -763,7 +849,7 @@ registerRoute({
                         ?,
                         ?,
                         'stripe',
-                        NULL,
+                        ?,
                         ?,
                         ?,
                         ?,
@@ -774,10 +860,12 @@ registerRoute({
                 args: [
                   newOrderId,
                   customerId,
+                  orderStatus,
                   staged.amount,
                   staged.amount,
                   staged.amountRefunded,
-                  staged.refunded === 1 ? 'refunded' : null,
+                  orderNotes,
+                  session?.id ?? null,
                   staged.stripePaymentIntentId,
                   resolvedAddressId,
                   resolvedAddressId,
@@ -812,11 +900,61 @@ registerRoute({
               const currentLineCount = Number(lineCountResult.rows?.[0]?.[0] ?? 0);
 
               if (currentLineCount === 0) {
-                await withRetry(
+                const linesInserted = await withRetry(
                   () => insertOrderLinesFromStripeSession(rawClient, stripe, staged.stripePaymentIntentId, targetOrderId, session?.id ?? null),
                   6,
                   200,
                 );
+
+                // Step 11+12: Post-finalize integrity check — zero lines means failure
+                if (linesInserted === 0) {
+                  // Rollback: delete the order we just created (only if we created it)
+                  if (!existingOrderBeforeId) {
+                    await rawClient.execute({
+                      sql: 'DELETE FROM orders WHERE id = ?',
+                      args: [targetOrderId],
+                    });
+                  }
+                  await withRetry(
+                    () => rawClient.execute({
+                      sql: `UPDATE stripe_order_import_staging
+                            SET status='failed', last_error='no_resolvable_line_items', attempts=?, updated_at=datetime('now')
+                            WHERE id=?`,
+                      args: [staged.attempts + 1, staged.id],
+                    }),
+                    10,
+                    200,
+                  );
+                  orderStats.failed++;
+                  continue;
+                }
+              }
+
+              // Step 12: Verify order + lines exist after insert
+              const verifyLines = await rawClient.execute({
+                sql: 'SELECT COUNT(*) FROM order_lines WHERE order_id = ?',
+                args: [targetOrderId],
+              }) as { rows?: unknown[][] };
+              const finalLineCount = Number(verifyLines.rows?.[0]?.[0] ?? 0);
+              if (finalLineCount === 0) {
+                if (!existingOrderBeforeId) {
+                  await rawClient.execute({
+                    sql: 'DELETE FROM orders WHERE id = ?',
+                    args: [targetOrderId],
+                  });
+                }
+                await withRetry(
+                  () => rawClient.execute({
+                    sql: `UPDATE stripe_order_import_staging
+                          SET status='failed', last_error='integrity_check_no_lines', attempts=?, updated_at=datetime('now')
+                          WHERE id=?`,
+                    args: [staged.attempts + 1, staged.id],
+                  }),
+                  10,
+                  200,
+                );
+                orderStats.failed++;
+                continue;
               }
             }
 
@@ -833,6 +971,18 @@ registerRoute({
                       SET status='finalized', last_error=NULL, attempts=?, updated_at=datetime('now')
                       WHERE id=?`,
                 args: [staged.attempts + 1, staged.id],
+              }),
+              10,
+              200,
+            );
+
+            // Step 16: Block duplicate webhook fulfillment for admin-synced orders
+            await withRetry(
+              () => rawClient.execute({
+                sql: `INSERT INTO processed_webhook_events (stripe_event_id, processed_at)
+                      VALUES (?, datetime('now'))
+                      ON CONFLICT(stripe_event_id) DO NOTHING`,
+                args: [`admin-sync:${staged.stripePaymentIntentId}`],
               }),
               10,
               200,
@@ -858,28 +1008,33 @@ registerRoute({
       }
 
       const stagingStatuses = await db
-        .select({ status: stripeOrderImportStaging.status })
+        .select({ status: stripeOrderImportStaging.status, claimedAt: stripeOrderImportStaging.claimedAt })
         .from(stripeOrderImportStaging);
-      const backlog = { pending: 0, failed: 0, finalized: 0 };
+      const nowMs = Date.now();
+      const fiveMinMs = 5 * 60 * 1000;
+      const backlog = { pending: 0, failed: 0, finalized: 0, staleProcessing: 0 };
       for (const row of stagingStatuses) {
         if (row.status === 'pending') backlog.pending++;
-        if (row.status === 'failed') backlog.failed++;
-        if (row.status === 'finalized') backlog.finalized++;
+        else if (row.status === 'failed') backlog.failed++;
+        else if (row.status === 'finalized') backlog.finalized++;
+        else if (row.status === 'processing') {
+          const claimedMs = row.claimedAt ? new Date(row.claimedAt).getTime() : 0;
+          if (nowMs - claimedMs > fiveMinMs) backlog.staleProcessing++;
+        }
       }
 
       return ok({
         phase,
         controls: {
           finalizeBatch,
-          stagePages: stagePageLimit,
-          nextStageCursor,
+          cursorPersisted: Boolean(lastProcessedChargeId),
         },
         products: productStats,
         customers: customerStats,
         orders: {
           ...orderStats,
           backlog,
-          remainingToFinalize: backlog.pending + backlog.failed,
+          remainingToFinalize: backlog.pending + backlog.failed + backlog.staleProcessing,
           debug: {
             skipReasons: orderSkipReasons,
             processingErrors: orderProcessingErrors,

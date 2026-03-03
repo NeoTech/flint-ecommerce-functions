@@ -82,7 +82,7 @@ export const products = sqliteTable('products', {
   comparePrice:    real('compare_price'),
   stock:           integer('stock').notNull().default(0),
   status:          text('status', { enum: ['draft', 'active', 'archived'] }).notNull().default('draft'),
-  stripeProductId: text('stripe_product_id'),
+  stripeProductId: text('stripe_product_id').unique(),
   stripePriceId:   text('stripe_price_id'),
   createdAt:       text('created_at').notNull().default(sql`(datetime('now'))`),
   updatedAt:       text('updated_at').notNull().default(sql`(datetime('now'))`),
@@ -176,9 +176,11 @@ export const stripeOrderImportStaging = sqliteTable('stripe_order_import_staging
   amount:                real('amount').notNull(),
   amountRefunded:        real('amount_refunded').notNull().default(0),
   refunded:              integer('refunded').notNull().default(0),
-  status:                text('status', { enum: ['pending', 'finalized', 'failed'] }).notNull().default('pending'),
+  status:                text('status', { enum: ['pending', 'processing', 'finalized', 'failed'] }).notNull().default('pending'),
   attempts:              integer('attempts').notNull().default(0),
   lastError:             text('last_error'),
+  claimedAt:             text('claimed_at'),
+  claimedBy:             text('claimed_by'),
   createdAt:             text('created_at').notNull().default(sql`(datetime('now'))`),
   updatedAt:             text('updated_at').notNull().default(sql`(datetime('now'))`),
 });
@@ -213,3 +215,16 @@ export const processedWebhookEvents = sqliteTable('processed_webhook_events', {
 
 export type ProcessedWebhookEvent = typeof processedWebhookEvents.$inferSelect;
 export type NewProcessedWebhookEvent = typeof processedWebhookEvents.$inferInsert;
+
+// ---- sync_cursors ------------------------------------------------------------
+// Persisted high-water marks for deterministic Stripe sync pagination.
+
+export const syncCursors = sqliteTable('sync_cursors', {
+  id:          text('id').primaryKey(),
+  cursorType:  text('cursor_type').notNull(),
+  cursorValue: text('cursor_value').notNull(),
+  updatedAt:   text('updated_at').notNull().default(sql`(datetime('now'))`),
+});
+
+export type SyncCursor = typeof syncCursors.$inferSelect;
+export type NewSyncCursor = typeof syncCursors.$inferInsert;

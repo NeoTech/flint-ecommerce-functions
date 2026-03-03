@@ -43,6 +43,13 @@
       "when": 1772488061883,
       "tag": "0005_two_phase_stripe_import",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1772489061883,
+      "tag": "0006_deterministic_sync",
+      "breakpoints": true
     }
   ]
 }

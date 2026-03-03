@@ -520,7 +520,7 @@ describe('POST /admin/sync/stripe', () => {
       expect(createdOrders.length).toBe(1);
       expect(createdOrders[0].source).toBe('stripe');
       expect(createdOrders[0].status).toBe('confirmed');
-      expect(createdOrders[0].stripeSessionId).toBeNull();
+      expect(createdOrders[0].stripeSessionId).toBe('cs_charge_test001');
       expect(createdOrders[0].shippingAddressId).toBeTruthy();
       expect(createdOrders[0].billingAddressId).toBeTruthy();
       expect(createdOrders[0].shippingAddressId).toBe(createdOrders[0].billingAddressId);

@@ -239,19 +239,8 @@ bun run test:coverage             # with coverage report
 E2E=1 bun test test/e2e/          # end-to-end (requires running server)
 ```
 
-## Generating OpenAPI Spec
-
-```bash
-bun scripts/gen-openapi.ts
-# outputs: docs/openapi.json
-```
-
 ## CI/CD
 
-GitHub Actions workflows in `.github/workflows/`:
-- `deploy-cloudflare.yml` — triggered on push to `main`; runs tests then deploys
-- `deploy-vercel.yml` — triggered on push/PR to `main`; runs tests then deploys
-
-Required GitHub Actions secrets:
-- `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`
-- `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID`
+Add GitHub Actions secrets for automated deployment:
+- `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` — for `bun run deploy:cf`
+- `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID` — for `bun run deploy:vercel`

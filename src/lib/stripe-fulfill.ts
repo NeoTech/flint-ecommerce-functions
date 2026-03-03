@@ -14,6 +14,7 @@ import {
   orders,
   processedWebhookEvents,
   products,
+  stripeOrderImportStaging,
   users,
 } from '../db/schema.js';
 import { getStripe } from './stripe.js';
@@ -34,6 +35,27 @@ export async function fulfillCheckoutSession(
     .where(eq(processedWebhookEvents.stripeEventId, eventId));
 
   if (already.length > 0) return false;
+
+  // Defer if this payment intent is still being processed by admin sync
+  const piId = typeof session.payment_intent === 'string' ? session.payment_intent : null;
+  if (piId) {
+    // Check if admin-sync already finalized an order for this PI
+    const adminSyncEntry = await db
+      .select()
+      .from(processedWebhookEvents)
+      .where(eq(processedWebhookEvents.stripeEventId, `admin-sync:${piId}`));
+    if (adminSyncEntry.length > 0) return false;
+
+    const stagingRow = await db
+      .select({ status: stripeOrderImportStaging.status })
+      .from(stripeOrderImportStaging)
+      .where(eq(stripeOrderImportStaging.stripePaymentIntentId, piId));
+
+    if (stagingRow.length > 0 && ['pending', 'processing'].includes(stagingRow[0].status)) {
+      console.log(`[stripe-fulfill] PI ${piId} is in staging, deferring webhook fulfillment`);
+      return false;
+    }
+  }
 
   const stripe = getStripe(env);
 
@@ -148,44 +170,8 @@ export async function fulfillCheckoutSession(
       .where(eq(products.stripeProductId, stripeProductId));
 
     if (productRows.length === 0) {
-      // Product exists in Stripe but not locally — import it on the fly.
-      // Use the expanded product name if available, otherwise fall back to the Stripe product ID.
-      const expandedProduct = priceObj?.product as Stripe.Product | null;
-      const productName = (expandedProduct && typeof expandedProduct === 'object' && expandedProduct.name)
-        ? expandedProduct.name
-        : stripeProductId;
-      const productDesc = (expandedProduct && typeof expandedProduct === 'object')
-        ? (expandedProduct.description ?? null)
-        : null;
-      const unitAmountFallback = (item.amount_total ?? 0) / 100 / (item.quantity ?? 1);
-
-      // Build a unique slug.
-      const baseSlug = productName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-      let slug = baseSlug;
-      let suffix = 2;
-      for (;;) {
-        const existing = await db.select({ id: products.id }).from(products).where(eq(products.slug, slug));
-        if (existing.length === 0) break;
-        slug = `${baseSlug}-${suffix++}`;
-      }
-
-      try {
-        await db.insert(products).values({
-          name: productName,
-          slug,
-          description: productDesc,
-          price: unitAmountFallback,
-          stock: 0,
-          status: 'active',
-          stripeProductId,
-          stripePriceId: priceObj?.id ?? null,
-        });
-      } catch (insertErr) {
-        // Could be a race condition or constraint violation — try to find the row anyway.
-        console.error(`[stripe-fulfill] Failed to auto-insert product ${stripeProductId}:`, insertErr);
-      }
-
-      productRows = await db.select().from(products).where(eq(products.stripeProductId, stripeProductId));
+      console.warn(`[stripe-fulfill] Unknown product ${stripeProductId}, skipping line item`);
+      continue;
     }
 
     const product = productRows[0];

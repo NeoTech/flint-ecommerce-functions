@@ -506,3 +506,102 @@ This keeps imports deterministic, retry-safe, and resumable across multiple requ
 ### Review
 
 48 endpoints documented across 9 files. Every endpoint includes: auth level, path parameters, query parameters, request body fields table (required/type/description), response body fields table, and error responses table. Status transition table added for orders. Shipment status values table added for logistics. All 4 data-health mutation actions documented with individual request/response examples.
+
+---
+
+## LOPC-21: Deterministic Stripe Sync Refactor
+
+**Goal:** Completely rewrite the Stripe sync pipeline so that every run produces identical, verifiable results regardless of timing, concurrency, or network variance. Fix the archive-state bug where every imported product ends up active. Eliminate the dual-writer race between webhooks and admin sync.
+
+**Decisions (locked with product owner):**
+- Stripe is the source of truth for product publish/archive state.
+- Webhooks are gated during historical backfill (ack + defer, no order writes).
+- Unknown Stripe products during order finalize: fail/skip for manual mapping (no auto-create).
+
+### Phase A: Data Integrity Foundation (Steps 1-5)
+
+- [x] LOPC-21-1: Add migration `0006_*` with three changes: (a) `CREATE UNIQUE INDEX products_stripe_product_id_unique ON products(stripe_product_id) WHERE stripe_product_id IS NOT NULL` to prevent ambiguous product mappings, (b) `ALTER TABLE stripe_order_import_staging ADD COLUMN claimed_at TEXT DEFAULT NULL` for lease-based finalize, (c) `ALTER TABLE stripe_order_import_staging ADD COLUMN claimed_by TEXT DEFAULT NULL` for worker identification. Run `bunx drizzle-kit generate` then `bunx drizzle-kit push`. Before applying: write and run a dedup script that resolves any existing duplicate `stripe_product_id` rows (keep the row with orders referencing it, merge the other's order_lines, delete the loser).
+
+- [x] LOPC-21-2: Update `src/db/schema.ts` to reflect the new unique index on `products.stripe_product_id`, the new `claimedAt`/`claimedBy` columns on staging, and add a new `processing` value to the staging status enum (`pending | processing | finalized | failed`). The schema must match the migration exactly.
+
+- [x] LOPC-21-3: Write a canonical `mapStripeProductStatus` function in a new file `src/lib/stripe-product-status.ts` that maps `Stripe.Product` -> local product status: `active=true` -> `'active'`, `active=false` -> `'archived'`. This function is the SINGLE source of truth for status mapping. Export it and import it everywhere that touches product status from Stripe. Write 4 unit tests: active->active, inactive->archived, deleted product->archived, edge cases (missing field defaults to archived).
+
+- [x] LOPC-21-4: Audit and fix every product creation/update path that touches Stripe data. There are exactly 3 locations that hardcode `status: 'active'`:
+  (a) `src/api/admin-sync.ts` line ~119: `insertOrderLinesFromStripeSession` auto-creates missing products as `'active'` -- REMOVE this entire auto-create block; replace with a log + skip + increment `orderStats.failed` with reason `'unknown_product'`.
+  (b) `src/api/admin-sync.ts` line ~410: catalog import from Stripe sets `status: 'active'` -- replace with `status: mapStripeProductStatus(sp)` using the Stripe product object.
+  (c) `src/lib/stripe-fulfill.ts` line ~179: webhook fulfillment auto-creates missing products as `'active'` -- REMOVE this auto-create block entirely; replace with log + skip. If product not found locally, skip the line item and log `[stripe-fulfill] Unknown product ${stripeProductId}, skipping line item`.
+  After this step: no code path can create a product with status derived from anything other than `mapStripeProductStatus`.
+
+- [x] LOPC-21-5: Extend catalog sync (Step 1 in admin-sync.ts, the `stripe.products.list` loop) to also fetch `active: false` products from Stripe by making a second paginated pass with `active: false`. For each inactive Stripe product that exists locally and is NOT already `'archived'`, update it to `'archived'`. For each inactive Stripe product that does NOT exist locally, insert it as `'archived'`. This ensures the local catalog is a mirror of Stripe state. Add counters: `productStats.archived` for status changes and `productStats.importedArchived` for new archived inserts.
+
+### Phase B: Deterministic Staging (Steps 6-10)
+
+- [x] LOPC-21-6: Rip out the caller-managed `stageCursor` / `stagePages` / `stagePageLimit` system from admin-sync.ts. Replace with a DB-persisted high-water mark: create a new table `sync_cursors` with columns `(id TEXT PK, cursor_type TEXT NOT NULL, cursor_value TEXT NOT NULL, updated_at TEXT NOT NULL)`. On each stage run, read the `stripe_charges` cursor row to get `starting_after`, page through ALL remaining charges (no page limit), and on completion write the last charge ID back. If the cursor row doesn't exist, start from the beginning. This means `phase=stage` is resumable and deterministic: each charge is visited exactly once across all runs.
+
+- [x] LOPC-21-7: Fix the staging upsert conflict clause. Currently `ON CONFLICT(stripe_payment_intent_id) DO UPDATE SET ... status = 'pending'` -- this RESETS already-finalized rows back to pending, causing re-processing and data variance. Change to: `ON CONFLICT(stripe_payment_intent_id) DO UPDATE SET ... status = CASE WHEN stripe_order_import_staging.status IN ('finalized') THEN stripe_order_import_staging.status ELSE 'pending' END`. Never touch a finalized row. This is the single biggest cause of "different data each run".
+
+- [x] LOPC-21-8: Add a `knownPaymentIntents` pre-check that also includes staging table rows (not just orders table). Currently the stage loop checks `orders.stripe_payment_intent_id` but NOT `stripe_order_import_staging.stripe_payment_intent_id`, so PIs already in staging get upserted every run. Build the set from BOTH tables. Combined with step 7, this eliminates redundant upserts entirely.
+
+- [x] LOPC-21-9: Add strict ordering to finalize row selection. Currently `SELECT ... FROM staging WHERE status IN ('pending','failed') LIMIT N` with no ORDER BY -- SQLite returns rows in arbitrary order, so different runs process different rows. Change to `ORDER BY created_at ASC, id ASC` so finalize is deterministic and FIFO. Failed rows are retried in creation order.
+
+- [x] LOPC-21-10: Implement lease-based claim for finalize. Before processing a batch: `UPDATE staging SET status='processing', claimed_at=datetime('now'), claimed_by=? WHERE id IN (SELECT id FROM staging WHERE status IN ('pending','failed') AND (claimed_at IS NULL OR claimed_at < datetime('now', '-5 minutes')) ORDER BY created_at ASC, id ASC LIMIT ?)`. Process claimed rows. On success: set `status='finalized'`. On failure: set `status='failed'`, `last_error=?`, increment `attempts`. On crash: stale claims (>5 min) are reclaimed by next run. This prevents concurrent finalize calls from racing on the same rows.
+
+### Phase C: Finalize Correctness (Steps 11-14)
+
+- [x] LOPC-21-11: Remove product auto-creation from `insertOrderLinesFromStripeSession`. When a Stripe line item references a `stripe_product_id` not in the local products table, skip the line item and log the skip. After all line items processed, if zero lines were resolved, mark the staging row as `failed` with `last_error = 'no_resolvable_line_items'`. Do NOT mark it `finalized` (current code marks it finalized even with zero lines -- this is the silent data loss bug).
+
+- [x] LOPC-21-12: Add a post-finalize integrity check inside the finalize loop. After inserting the order + lines, verify: (a) the order row exists AND (b) `COUNT(order_lines) > 0` for that order. If either check fails, rollback: delete the order row and mark staging as `failed` with reason. Only set `finalized` after this check passes.
+
+- [x] LOPC-21-13: Make finalize set `stripe_session_id` on the order when available. Currently the finalize path sets `stripe_session_id = NULL` even when it successfully fetched the session (the `NULL` is hardcoded in the INSERT). Change to pass `session?.id ?? null` so orders created by admin sync have session traceability.
+
+- [x] LOPC-21-14: Handle refunded orders correctly in finalize. Currently if `staged.refunded === 1` the code sets `notes = 'refunded'` but `status = 'confirmed'`. If the charge is fully refunded, set `status = 'refunded'` and `refunded_amount = staged.amount_refunded`. If partially refunded, set `status = 'confirmed'` but still populate `refunded_amount`. Add a test for each case.
+
+### Phase D: Webhook Gating (Steps 15-16)
+
+- [x] LOPC-21-15: Add a `backfill_active` flag. Approach: check for pending/processing rows in `stripe_order_import_staging` at webhook time. In `src/lib/stripe-fulfill.ts`, before inserting the order, query for the payment intent in the staging table. If a staging row exists with `status IN ('pending','processing')`, return `false` (defer) and log `[stripe-fulfill] PI ${piId} is in staging, deferring webhook fulfillment`. The webhook handler in `src/api/webhooks.ts` still returns `200 { received: true }` to Stripe (acknowledge receipt), but the order is not written. Stripe will retry, and once the staging row is finalized or absent, the webhook will be processed normally OR the finished order from admin sync will satisfy the idempotency check.
+
+- [x] LOPC-21-16: Add a `processed_webhook_events` row during admin-sync finalize so that completed staged orders don't get double-created when Stripe retries the webhook. After finalize inserts the order, also insert a synthetic event ID (`admin-sync:${staged.stripePaymentIntentId}`) into `processed_webhook_events`. The webhook fulfillment idempotency check will find this row and skip.
+
+### Phase E: API Surface Alignment (Steps 17-18)
+
+- [x] LOPC-21-17: Align the query parameter names between docs and code. Docs say `batchSize`, code reads `finalizeBatch`. Docs say phase values `all|stage|finalize|status`, code also accepts `catalog`. Pick one: rename the code parameter from `finalizeBatch` to `batchSize` for consistency with docs, and document `catalog` as a valid phase value. Update the `badRequest` validation message. Update `docs/api/admin.md` to match.
+
+- [x] LOPC-21-18: Update `docs/api/admin.md`, `docs/schema.md`, `llms.txt`, and the `GET /admin/data-health` response to reflect all changes: new staging columns (`claimed_at`, `claimed_by`), new staging status value (`processing`), new `sync_cursors` table, new product archive counters, webhook gating behavior, and corrected parameter names. Add a "Backfill Runbook" section to `docs/api/admin.md` explaining the safe operational sequence: `phase=catalog` -> `phase=stage` -> repeat `phase=finalize&batchSize=3` until `remainingToFinalize=0` -> verify via `phase=status` and `GET /admin/data-health`.
+
+### Phase F: Testing and Verification (Steps 19-20)
+
+- [x] LOPC-21-19: Write deterministic replay tests in `src/api/stripe-sync.test.ts` (new file). Required test cases:
+  (a) Same Stripe charge fixture staged twice -> staging table has exactly 1 row, not 2.
+  (b) Finalized row is NOT reset to pending by a subsequent stage pass.
+  (c) Finalize with unknown product -> row marked `failed`, NOT `finalized`.
+  (d) Finalize with zero resolved line items -> row marked `failed`, order NOT created.
+  (e) Lease-based claim: two concurrent finalize calls don't process the same row.
+  (f) Archive mapping: `Stripe.Product{active:false}` -> local `status='archived'`, never `'active'`.
+  (g) Webhook gating: webhook with PI in staging returns false (deferred), order not created.
+  (h) Webhook after finalize: processed_webhook_events has the synthetic admin-sync entry, webhook is no-op.
+  (i) Full end-to-end replay: catalog sync -> stage -> finalize -> verify order count and line_items match fixture. Run twice, assert identical DB state.
+
+- [x] LOPC-21-20: Production verification sequence (manual, but scripted via `scripts/sync-verify.ts`). Steps:
+  (a) Run `bun run scripts/cleanup-db.ts` for clean baseline.
+  (b) `POST /admin/sync/stripe?phase=catalog` -- verify product count matches Stripe (active + archived).
+  (c) `POST /admin/sync/stripe?phase=stage` -- verify staging row count matches Stripe paid charges.
+  (d) `POST /admin/sync/stripe?phase=status` -- capture `{ pending, finalized, failed }` baseline.
+  (e) Loop `POST /admin/sync/stripe?phase=finalize&batchSize=3` until `remainingToFinalize = 0`.
+  (f) `POST /admin/sync/stripe?phase=status` -- assert `pending=0, failed=0` (or document permanently failing rows with reasons).
+  (g) `GET /admin/data-health` -- assert zero orphans, zero stuck webhook orders.
+  (h) Run steps (b)-(g) a SECOND time. Assert zero new rows created (full idempotency).
+  (i) Compare product statuses against Stripe: every `active:false` Stripe product must be `archived` locally, every `active:true` must be `active` locally. Zero mismatches.
+  (j) Select 3 random imported orders, run `scripts/verify-order-parity.ts` against Stripe source. Assert `mismatchCount: 0` for each.
+
+### Verification checkpoints
+
+- [x] No code path creates products with hardcoded `status: 'active'` from Stripe data; `mapStripeProductStatus` is the only authority
+- [x] `products.stripe_product_id` has a unique index; no duplicate mappings possible
+- [x] Staging upsert never resets `finalized` rows to `pending`
+- [x] Finalize selects rows in deterministic order (created_at ASC, id ASC)
+- [x] Finalize uses lease-based claims; concurrent calls cannot race
+- [x] Zero-line-item orders are never marked `finalized`; they are `failed`
+- [x] Webhook fulfillment defers when payment intent is in staging
+- [x] Admin-sync finalize writes a `processed_webhook_events` row to block duplicate webhook fulfillment
+- [x] Running full sync twice from clean state produces byte-identical DB snapshots
+- [x] All existing tests pass; new test file has 9+ test cases; zero failures

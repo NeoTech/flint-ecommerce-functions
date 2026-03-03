@@ -16,67 +16,105 @@ Bidirectional reconciliation between the local database and Stripe. Runs in phas
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `phase` | `string` | No | `all` (default), `stage`, `finalize`, or `status` |
-| `batchSize` | `number` | No | Number of staged orders to finalize per call (default `3`) |
+| `phase` | `string` | No | `all` (default), `catalog`, `stage`, `finalize`, or `status` |
+| `batchSize` | `number` | No | Number of staged orders to finalize per call (default `3`, max `50`) |
 
 ### Phases
 
 | Phase | Description |
 |---|---|
 | `all` | Stage Stripe charges **and** finalize in one call (may hit subrequest limits for large catalogs) |
-| `stage` | Import Stripe product/customer/charge data into local staging tables — no orders written yet |
+| `catalog` | Sync products and customers only (Steps 1-4) — no charge import or finalization |
+| `stage` | Import Stripe product/customer/charge data into local staging tables — no orders written yet. Pagination cursor is persisted in the `sync_cursors` table so staging is resumable across calls. |
 | `finalize` | Convert staged rows into `orders` + `order_lines` in bounded batches (safe to call repeatedly) |
 | `status` | Return backlog counts without any mutations |
 
-### Response `200` — `phase=all` or `phase=finalize`
+### Response `200` — `phase=all`, `phase=catalog`, or `phase=finalize`
 
 ```json
 {
   "data": {
+    "phase": "all",
+    "controls": {
+      "finalizeBatch": 3,
+      "cursorPersisted": true
+    },
     "products": {
       "imported": 3,
       "created": 1,
       "synced": 2,
-      "skipped": 0
+      "upToDate": 0,
+      "archived": 1,
+      "importedArchived": 0
     },
     "customers": {
       "imported": 5,
       "synced": 3,
       "created": 2,
-      "skipped": 0
+      "upToDate": 0
     },
     "orders": {
       "staged": 10,
       "finalized": 3,
       "skipped": 7,
-      "failed": 0
+      "failed": 0,
+      "backlog": {
+        "pending": 7,
+        "failed": 0,
+        "finalized": 3,
+        "staleProcessing": 0
+      },
+      "remainingToFinalize": 7
     }
   }
 }
 ```
+
+| Field | Description |
+|---|---|
+| `controls.finalizeBatch` | Batch size used for this call |
+| `controls.cursorPersisted` | `true` if a Stripe pagination cursor was saved in `sync_cursors` for resumable staging |
+| `products.archived` | Local products whose corresponding Stripe product is archived — status set to `archived` |
+| `products.importedArchived` | Stripe archived products imported as new local rows with `status=archived` |
+| `orders.backlog` | Counts by staging status: `pending`, `failed`, `finalized`, `staleProcessing` |
+| `orders.backlog.staleProcessing` | Rows stuck in `processing` state for more than 5 minutes (lease expired — will be reclaimed on next finalize call) |
+| `orders.remainingToFinalize` | `pending + failed + staleProcessing` — rows still awaiting finalization |
 
 ### Response `200` — `phase=status`
 
 ```json
 {
   "data": {
-    "pending": 7,
-    "finalized": 3,
-    "failed": 0,
-    "remainingToFinalize": 7
+    "phase": "status",
+    "products": { "imported": 0, "created": 0, "synced": 0, "upToDate": 0, "archived": 0, "importedArchived": 0 },
+    "customers": { "imported": 0, "synced": 0, "created": 0, "upToDate": 0 },
+    "orders": {
+      "staged": 0,
+      "finalized": 0,
+      "skipped": 0,
+      "failed": 0,
+      "backlog": {
+        "pending": 7,
+        "failed": 0,
+        "finalized": 3,
+        "staleProcessing": 0
+      },
+      "remainingToFinalize": 7
+    }
   }
 }
 ```
 
-#### Sync Steps (phase=all/stage)
+#### Sync Steps (phase=all/catalog/stage)
 
-| Step | Description |
-|---|---|
-| 1 | Stripe active products → local DB (import missing, deduplicate slugs) |
-| 2 | Local products without Stripe IDs → Stripe (create Product + Price) |
-| 3 | Stripe customers → local DB (link `stripeCustomerId` for known emails, create guest rows for unknown) |
-| 4 | Local users without `stripeCustomerId` → Stripe (look up by email or create) |
-| 5 | Historical paid Stripe charges → `stripe_order_import_staging` table |
+| Step | Runs in phase | Description |
+|---|---|---|
+| 1 | `all`, `catalog`, `stage` | Stripe active products → local DB (import missing, deduplicate slugs) |
+| 1b | `all`, `catalog`, `stage` | Stripe archived products → archive matching local rows or import as `archived` |
+| 2 | `all`, `catalog`, `stage` | Local products without Stripe IDs → Stripe (create Product + Price) |
+| 3 | `all`, `catalog`, `stage` | Stripe customers → local DB (link `stripeCustomerId` for known emails, create guest rows for unknown) |
+| 4 | `all`, `catalog`, `stage` | Local users without `stripeCustomerId` → Stripe (look up by email or create) |
+| 5 | `all`, `stage` | Historical paid Stripe charges → `stripe_order_import_staging` table (cursor-based, resumable via `sync_cursors`) |
 
 #### Finalize step
 
@@ -86,6 +124,19 @@ Reads rows from `stripe_order_import_staging` in batches. For each:
 - Upserts shipping/billing addresses
 - Inserts `orders` + `order_lines`
 - Idempotent on `stripe_payment_intent_id`
+
+### Webhook Gating
+
+While a payment intent has a row in `stripe_order_import_staging` with status `pending` or `processing`, the webhook fulfillment handler (`POST /webhooks/stripe`) will **defer** processing and return early. This prevents race conditions where a Stripe webhook fires for a charge that is still being staged or finalized by admin sync. Once the staging row transitions to `finalized` or `failed`, webhooks are processed normally.
+
+### Backfill Runbook
+
+Safe operational sequence for a full historical backfill:
+
+1. **`phase=catalog`** — Sync products and customers from Stripe without importing charges.
+2. **`phase=stage`** — Stage all historical charges into `stripe_order_import_staging`. Resumable: the pagination cursor is persisted in `sync_cursors`, so you can repeat this call if it times out.
+3. **`phase=finalize&batchSize=10`** — Convert staged rows into orders in bounded batches. Repeat until `remainingToFinalize=0`.
+4. **Verify** — Call `phase=status` to confirm zero remaining, then `GET /admin/data-health` to check for orphans or stuck webhooks.
 
 ### Error Responses
 

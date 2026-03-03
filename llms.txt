@@ -151,7 +151,7 @@ List endpoints accept `page` (default `1`) and `pageSize` (default `20`) query p
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/admin/sync/stripe` | admin | Bidirectional Stripe reconciliation. Query: `phase` (`all`/`stage`/`finalize`/`status`), `batchSize?`. |
+| POST | `/admin/sync/stripe` | admin | Bidirectional Stripe reconciliation. Query: `phase` (`all`/`catalog`/`stage`/`finalize`/`status`), `batchSize?`. Staging cursor is DB-persisted in `sync_cursors` for resumable imports. Webhooks are deferred while a PI is in staging (`pending`/`processing`). |
 | GET | `/admin/data-health` | admin | Read-only diagnostic: table counts, orphan rows, duplicate addresses, stuck webhook orders. |
 | POST | `/admin/data-health?action=purge-orphans` | admin | Delete orphan rows in FK-safe order. |
 | POST | `/admin/data-health?action=dedupe-addresses` | admin | Remove exact duplicate address rows, keeping the one referenced by an order. |
@@ -173,7 +173,8 @@ List endpoints accept `page` (default `1`) and `pageSize` (default `20`) query p
 ## Key Behaviours
 
 - **Stock management**: decremented atomically on order creation; restored on cancellation.
-- **Stripe sync**: products and customers are synced bidirectionally via `POST /admin/sync/stripe`. Stripe product/price IDs are stored on local rows after first sync.
+- **Stripe sync**: products and customers are synced bidirectionally via `POST /admin/sync/stripe`. Stripe product/price IDs are stored on local rows after first sync. The `catalog` phase syncs products and customers only. The `stage` phase imports historical charges with a DB-persisted cursor. The `finalize` phase converts staged rows to orders in bounded batches controlled by `batchSize`. Response includes `controls.cursorPersisted` (boolean), product counters `archived` / `importedArchived` for Stripe-archived products, and `backlog.staleProcessing` for lease-expired rows that will be auto-reclaimed. `remainingToFinalize` = `pending + failed + staleProcessing`.
+- **Webhook gating**: when a payment intent exists in `stripe_order_import_staging` with status `pending` or `processing`, webhook fulfillment is deferred to avoid race conditions with admin sync.
 - **Webhook idempotency**: every Stripe event is recorded in `processed_webhook_events`. Duplicate deliveries are silently ignored.
 - **Order source**: `source` field is `api` for orders created through the API and `stripe_import` for orders imported from historical Stripe charges.
 - **Soft delete**: products are archived (`status → archived`), not hard-deleted.

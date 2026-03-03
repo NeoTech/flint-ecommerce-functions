@@ -191,10 +191,25 @@ Two-phase import buffer for historical Stripe Payment Intents. Records move thro
 | `amount` | REAL | NOT NULL | Charge amount in store currency |
 | `amount_refunded` | REAL | NOT NULL, DEFAULT `0` | Cumulative refunded amount |
 | `refunded` | INTEGER | NOT NULL, DEFAULT `0` | Boolean (0/1) — fully refunded flag |
-| `status` | TEXT | NOT NULL, DEFAULT `pending` | Enum: `pending`, `processing`, `done`, `failed` |
+| `status` | TEXT | NOT NULL, DEFAULT `pending` | Enum: `pending`, `processing`, `finalized`, `failed` |
 | `attempts` | INTEGER | NOT NULL, DEFAULT `0` | Processing attempt count |
 | `last_error` | TEXT | | Last error message if failed |
+| `claimed_at` | TEXT | | ISO-8601 UTC — set when a finalize batch claims this row |
+| `claimed_by` | TEXT | | Unique claim ID for the finalize batch that owns this row |
 | `created_at` | TEXT | NOT NULL | ISO-8601 UTC |
+| `updated_at` | TEXT | NOT NULL | ISO-8601 UTC |
+
+---
+
+## Table: sync_cursors
+
+Persisted high-water marks for deterministic Stripe sync pagination. Allows staging to resume across multiple calls without re-fetching already-processed pages.
+
+| Column | Type | Constraints | Notes |
+|---|---|---|---|
+| `id` | TEXT | PRIMARY KEY | Logical cursor name (e.g. `stripe_charges`) |
+| `cursor_type` | TEXT | NOT NULL | Type discriminator (e.g. `charge`) |
+| `cursor_value` | TEXT | NOT NULL | Opaque Stripe cursor / object ID |
 | `updated_at` | TEXT | NOT NULL | ISO-8601 UTC |
 
 ---
@@ -237,4 +252,5 @@ addresses ← orders (billing_address_id → addresses.id)
 
 processed_webhook_events  (standalone — no FKs)
 stripe_order_import_staging  (standalone — no FKs)
+sync_cursors  (standalone — no FKs)
 ```
