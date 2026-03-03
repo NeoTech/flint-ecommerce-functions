@@ -1,4 +1,4 @@
-# LOPC API
+# L(ogistic)O(rder)P(roduct)C(customer) API
 
 A serverless e-commerce backend API. Handles authentication, products, categories, customers, orders, and logistics. Deployable on Cloudflare Workers and Vercel Edge.
 
