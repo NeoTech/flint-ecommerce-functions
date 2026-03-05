@@ -461,6 +461,7 @@ describe('POST /admin/sync/stripe', () => {
           {
             id: 'ch_test001',
             status: 'succeeded',
+            created: 1705320000,
             refunded: false,
             amount: 2999,
             amount_refunded: 0,

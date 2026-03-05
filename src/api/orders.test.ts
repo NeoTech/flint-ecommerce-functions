@@ -5,7 +5,7 @@
  * Uses a local SQLite file (local.sqlite) with migrations applied in beforeAll.
  * Test data is cleaned up in afterEach to keep tests independent.
  */
-import { afterEach, beforeAll, describe, expect, it } from 'bun:test';
+import { afterEach, beforeAll, describe, expect, it, mock } from 'bun:test';
 import { exportPKCS8, exportSPKI, generateKeyPair } from 'jose';
 import { createClient } from '@libsql/client';
 import { drizzle } from 'drizzle-orm/libsql';
@@ -15,6 +15,19 @@ import { eq } from 'drizzle-orm';
 import type { AppEnv } from '../types.js';
 import { dispatch } from '../router.js';
 import { issueAccessToken } from '../lib/tokens.js';
+
+// ---------------------------------------------------------------------------
+// Stripe mock — hoisted before app.ts so getStripe() returns the fake client
+// ---------------------------------------------------------------------------
+
+const mockRefundsCreate = mock(async (_params: unknown) => ({ id: 're_test001' }));
+
+mock.module('../lib/stripe.js', () => ({
+  getStripe: () => ({
+    refunds: { create: mockRefundsCreate },
+  }),
+}));
+
 import '../app.js';
 
 // ---------------------------------------------------------------------------
@@ -383,6 +396,144 @@ describe('DELETE /orders/:id', () => {
 // ---------------------------------------------------------------------------
 
 describe('POST /orders/:id/refund', () => {
+  it('api-created order: updates local DB without calling Stripe', async () => {
+    const { userId, customerId } = await createCustomer('refund-api@test.com');
+    const product = await createProduct('ApiProd', 30.00, 5);
+    const address = await createAddress(customerId, userId);
+
+    const createRes  = await createOrder(userId, [{ productId: product.id, quantity: 1 }], address.id);
+    const createBody = await createRes.json() as any;
+    const orderId    = createBody.data.id;
+
+    for (const status of ['confirmed', 'processing', 'shipped', 'delivered']) {
+      await dispatch(
+        new Request(`${BASE}/orders/${orderId}/status`, {
+          method:  'PUT',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+          body:    JSON.stringify({ status }),
+        }),
+        env,
+      );
+    }
+
+    mockRefundsCreate.mockReset();
+
+    const res  = await dispatch(
+      new Request(`${BASE}/orders/${orderId}/refund`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+        body:    JSON.stringify({ amount: 30, reason: 'test' }),
+      }),
+      env,
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.data.status).toBe('refunded');
+    expect(body.data.refundedAmount).toBe(30);
+    expect(body.data.stripeRefundId).toBeNull();
+    // No Stripe call for API-created orders
+    expect(mockRefundsCreate).not.toHaveBeenCalled();
+  });
+
+  it('stripe-originated order: calls stripe.refunds.create and returns refundId', async () => {
+    const { userId, customerId } = await createCustomer('refund-stripe@test.com');
+    const product = await createProduct('StripeProd', 50.00, 5);
+    const address = await createAddress(customerId, userId);
+
+    const createRes  = await createOrder(userId, [{ productId: product.id, quantity: 1 }], address.id);
+    const createBody = await createRes.json() as any;
+    const orderId    = createBody.data.id;
+
+    // Simulate a Stripe-originated order by setting a payment intent ID directly in DB
+    await cleanupDb
+      .update(schema.orders)
+      .set({ stripePaymentIntentId: 'pi_test_refund001' })
+      .where(eq(schema.orders.id, orderId));
+
+    for (const status of ['confirmed', 'processing', 'shipped', 'delivered']) {
+      await dispatch(
+        new Request(`${BASE}/orders/${orderId}/status`, {
+          method:  'PUT',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+          body:    JSON.stringify({ status }),
+        }),
+        env,
+      );
+    }
+
+    mockRefundsCreate.mockReset();
+    mockRefundsCreate.mockImplementation(async () => ({ id: 're_test_abc' }));
+
+    const res  = await dispatch(
+      new Request(`${BASE}/orders/${orderId}/refund`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+        body:    JSON.stringify({ amount: 50, reason: 'requested_by_customer' }),
+      }),
+      env,
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.data.status).toBe('refunded');
+    expect(body.data.refundedAmount).toBe(50);
+    expect(body.data.stripeRefundId).toBe('re_test_abc');
+    expect(mockRefundsCreate).toHaveBeenCalledTimes(1);
+    // Amount sent to Stripe is in cents
+    expect(mockRefundsCreate.mock.calls[0][0]).toMatchObject({
+      payment_intent: 'pi_test_refund001',
+      amount: 5000,
+    });
+  });
+
+  it('stripe failure returns 500 and does not modify local DB', async () => {
+    const { userId, customerId } = await createCustomer('refund-fail@test.com');
+    const product = await createProduct('FailProd', 20.00, 5);
+    const address = await createAddress(customerId, userId);
+
+    const createRes  = await createOrder(userId, [{ productId: product.id, quantity: 1 }], address.id);
+    const createBody = await createRes.json() as any;
+    const orderId    = createBody.data.id;
+
+    await cleanupDb
+      .update(schema.orders)
+      .set({ stripePaymentIntentId: 'pi_test_fail001' })
+      .where(eq(schema.orders.id, orderId));
+
+    for (const status of ['confirmed', 'processing', 'shipped', 'delivered']) {
+      await dispatch(
+        new Request(`${BASE}/orders/${orderId}/status`, {
+          method:  'PUT',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+          body:    JSON.stringify({ status }),
+        }),
+        env,
+      );
+    }
+
+    mockRefundsCreate.mockReset();
+    mockRefundsCreate.mockImplementation(async () => { throw new Error('card_declined'); });
+
+    const res = await dispatch(
+      new Request(`${BASE}/orders/${orderId}/refund`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+        body:    JSON.stringify({ amount: 20, reason: 'test' }),
+      }),
+      env,
+    );
+
+    expect(res.status).toBe(500);
+    const body = await res.json() as any;
+    expect(body.error.message).toContain('card_declined');
+
+    // Local DB must be unchanged
+    const [dbOrder] = await cleanupDb.select().from(schema.orders).where(eq(schema.orders.id, orderId));
+    expect(dbOrder.refundedAmount).toBe(0);
+    expect(dbOrder.status).toBe('delivered');
+  });
+
   it('admin can refund a full order and status becomes refunded', async () => {
     const { userId, customerId } = await createCustomer('refund1@test.com');
     const product = await createProduct('RefundProd', 50.00, 5);

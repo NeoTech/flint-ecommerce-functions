@@ -122,7 +122,10 @@ Reads rows from `stripe_order_import_staging` in batches. For each:
 - Looks up Stripe Checkout Session line items
 - Resolves or creates local product rows
 - Upserts shipping/billing addresses
+- Creates missing local customer profiles when checkout identity maps to an existing user without a customer row
+- Backfills low-quality customer names (e.g. email/`-`) from Stripe checkout names when available
 - Inserts `orders` + `order_lines`
+- Preserves original transaction time (`orders.created_at` / `orders.updated_at` use Stripe charge `created` timestamp)
 - Idempotent on `stripe_payment_intent_id`
 
 ### Webhook Gating
@@ -137,6 +140,20 @@ Safe operational sequence for a full historical backfill:
 2. **`phase=stage`** — Stage all historical charges into `stripe_order_import_staging`. Resumable: the pagination cursor is persisted in `sync_cursors`, so you can repeat this call if it times out.
 3. **`phase=finalize&batchSize=10`** — Convert staged rows into orders in bounded batches. Repeat until `remainingToFinalize=0`.
 4. **Verify** — Call `phase=status` to confirm zero remaining, then `GET /admin/data-health` to check for orphans or stuck webhooks.
+
+### Customer Name Repair Resync (existing historical imports)
+
+If older imported orders have placeholder or email-style customer names, run this one-time repair sequence:
+
+1. Delete only Stripe-import order artifacts (do **not** delete API-created orders):
+  - `orders` where `source='stripe'`
+  - all rows in `stripe_order_import_staging`
+  - `sync_cursors` row with `id='stripe_charges'`
+  - synthetic webhook rows (`processed_webhook_events` where `stripe_event_id` starts with `admin-sync:` for the deleted payment intents)
+2. Run `phase=stage` once.
+3. Run `phase=finalize` in a loop until `remainingToFinalize=0`.
+4. If large batch finalize fails with `INTERNAL_ERROR`, switch to `batchSize=1` and continue looping until drained.
+5. Verify representative repaired rows in DB (`customers.first_name`, `customers.last_name`) and run `phase=status`.
 
 ### Error Responses
 

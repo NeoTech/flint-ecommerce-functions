@@ -21,9 +21,11 @@ import {
   notFound,
   ok,
   parsePagination,
+  serverError,
   unprocessable,
 } from '../types.js';
 import { reserveStock, releaseStock } from '../lib/inventory.js';
+import { getStripe } from '../lib/stripe.js';
 
 // ---- Helpers ----------------------------------------------------------------
 
@@ -440,7 +442,7 @@ registerRoute({
   method: 'POST',
   path: '/orders/:id/refund',
   auth: 'admin',
-  description: 'Apply a refund to a delivered or refunded order. Admin only.',
+  description: 'Issue a (partial or full) refund. Calls Stripe when a payment intent is present, then updates local DB. Admin only.',
   handler: async (request, ctx, params) => {
     const parsed = await parseBody(request, RefundSchema);
     if (!parsed.ok) return parsed.response;
@@ -460,6 +462,25 @@ registerRoute({
     }
 
     const { amount } = parsed.data;
+
+    // Issue refund on Stripe when a payment intent exists (Stripe-originated orders).
+    // API-created orders have no PI — skip Stripe silently.
+    let stripeRefundId: string | null = null;
+    if (order.stripePaymentIntentId) {
+      try {
+        const stripe = getStripe(ctx.env);
+        // Stripe amounts are in the smallest currency unit (cents for USD).
+        const stripeRefund = await stripe.refunds.create({
+          payment_intent: order.stripePaymentIntentId,
+          amount: Math.round(amount * 100),
+        });
+        stripeRefundId = stripeRefund.id;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return serverError(`Stripe refund failed: ${msg}`);
+      }
+    }
+
     const newRefundedAmount = order.refundedAmount + amount;
     const newStatus = newRefundedAmount >= order.subtotal ? 'refunded' : order.status;
 
@@ -473,6 +494,6 @@ registerRoute({
       .where(eq(orders.id, order.id))
       .returning();
 
-    return ok(updated[0]);
+    return ok({ ...updated[0], stripeRefundId });
   },
 });

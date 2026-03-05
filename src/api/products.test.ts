@@ -90,6 +90,11 @@ async function adminHeaders(): Promise<Record<string, string>> {
   return { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
 }
 
+async function customerHeaders(): Promise<Record<string, string>> {
+  const token = await issueAccessToken('customer-user-id', 'customer', env);
+  return { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+}
+
 async function json<T>(res: Response): Promise<T> {
   return res.json() as Promise<T>;
 }
@@ -144,6 +149,63 @@ describe('GET /products', () => {
     expect(body.meta.page).toBe(1);
     expect(body.meta.pageSize).toBe(10);
     expect(typeof body.meta.total).toBe('number');
+  });
+
+  it('admin + status=draft returns draft only', async () => {
+    const headers = await adminHeaders();
+    await post('/products', { name: 'Draft One', price: 10, status: 'draft' }, headers);
+    await post('/products', { name: 'Active One', price: 12, status: 'active' }, headers);
+    await post('/products', { name: 'Archived One', price: 14, status: 'archived' }, headers);
+
+    const res = await get('/products?status=draft&page=1&pageSize=50', headers);
+    expect(res.status).toBe(200);
+    const body = await json<{ data: Array<{ status: string }>; meta: { total: number } }>(res);
+    expect(body.data.length).toBeGreaterThan(0);
+    expect(body.data.every((p) => p.status === 'draft')).toBe(true);
+    expect(body.meta.total).toBe(body.data.length);
+  });
+
+  it('admin + status=archived returns archived only', async () => {
+    const headers = await adminHeaders();
+    await post('/products', { name: 'Draft Two', price: 10, status: 'draft' }, headers);
+    await post('/products', { name: 'Active Two', price: 12, status: 'active' }, headers);
+    await post('/products', { name: 'Archived Two', price: 14, status: 'archived' }, headers);
+
+    const res = await get('/products?status=archived&page=1&pageSize=50', headers);
+    expect(res.status).toBe(200);
+    const body = await json<{ data: Array<{ status: string }>; meta: { total: number } }>(res);
+    expect(body.data.length).toBeGreaterThan(0);
+    expect(body.data.every((p) => p.status === 'archived')).toBe(true);
+    expect(body.meta.total).toBe(body.data.length);
+  });
+
+  it('admin + status=active returns active only', async () => {
+    const headers = await adminHeaders();
+    await post('/products', { name: 'Draft Three', price: 10, status: 'draft' }, headers);
+    await post('/products', { name: 'Active Three', price: 12, status: 'active' }, headers);
+    await post('/products', { name: 'Archived Three', price: 14, status: 'archived' }, headers);
+
+    const res = await get('/products?status=active&page=1&pageSize=50', headers);
+    expect(res.status).toBe(200);
+    const body = await json<{ data: Array<{ status: string }>; meta: { total: number } }>(res);
+    expect(body.data.length).toBeGreaterThan(0);
+    expect(body.data.every((p) => p.status === 'active')).toBe(true);
+    expect(body.meta.total).toBe(body.data.length);
+  });
+
+  it('non-admin remains active-only even with status query', async () => {
+    const admin = await adminHeaders();
+    const customer = await customerHeaders();
+    await post('/products', { name: 'Draft Four', price: 10, status: 'draft' }, admin);
+    await post('/products', { name: 'Active Four', price: 12, status: 'active' }, admin);
+    await post('/products', { name: 'Archived Four', price: 14, status: 'archived' }, admin);
+
+    const res = await get('/products?status=draft&page=1&pageSize=50', customer);
+    expect(res.status).toBe(200);
+    const body = await json<{ data: Array<{ status: string }>; meta: { total: number } }>(res);
+    expect(body.data.length).toBeGreaterThan(0);
+    expect(body.data.every((p) => p.status === 'active')).toBe(true);
+    expect(body.meta.total).toBe(body.data.length);
   });
 });
 

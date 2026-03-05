@@ -127,6 +127,26 @@ function toSlug(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 }
 
+function splitFullName(name: string | null | undefined): { firstName: string; lastName: string } | null {
+  const trimmed = (name ?? '').trim();
+  if (!trimmed) return null;
+  const parts = trimmed.split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return null;
+  if (parts.length === 1) return { firstName: parts[0], lastName: '-' };
+  return { firstName: parts[0], lastName: parts.slice(1).join(' ') };
+}
+
+function hasLowQualityCustomerName(firstName: string, lastName: string, email: string): boolean {
+  const f = firstName.trim().toLowerCase();
+  const l = lastName.trim().toLowerCase();
+  const e = email.trim().toLowerCase();
+  if (!f || !l) return true;
+  if (f === e) return true;
+  if (f === 'unknown' || f === 'guest' || f === 'missing') return true;
+  if (l === '-' || l === 'unknown' || l === 'customer' || l === 'address') return true;
+  return false;
+}
+
 async function uniqueSlug(base: string, db: ReturnType<typeof getDb>): Promise<string> {
   let slug = base;
   let n = 2;
@@ -686,7 +706,7 @@ registerRoute({
                         'pending',
                         0,
                         NULL,
-                        datetime('now'),
+                        datetime(?, 'unixepoch'),
                         datetime('now')
                       )
                       ON CONFLICT(stripe_payment_intent_id) DO UPDATE SET
@@ -696,6 +716,7 @@ registerRoute({
                         amount = excluded.amount,
                         amount_refunded = excluded.amount_refunded,
                         refunded = excluded.refunded,
+                        created_at = CASE WHEN stripe_order_import_staging.status IN ('finalized') THEN stripe_order_import_staging.created_at ELSE excluded.created_at END,
                         status = CASE WHEN stripe_order_import_staging.status IN ('finalized') THEN stripe_order_import_staging.status ELSE 'pending' END,
                         updated_at = datetime('now')`,
                 args: [
@@ -707,6 +728,7 @@ registerRoute({
                   charge.amount / 100,
                   (charge.amount_refunded ?? 0) / 100,
                   charge.refunded ? 1 : 0,
+                  charge.created,
                 ],
               }),
               20,
@@ -768,15 +790,6 @@ registerRoute({
 
         for (const staged of stagedRows) {
           try {
-            const userRow =
-              (staged.stripeCustomerId ? usersByStripeCustomerId.get(staged.stripeCustomerId) : undefined)
-              ?? (staged.billingEmail ? usersByEmail.get(staged.billingEmail) : undefined)
-              ?? undefined;
-
-            const customerId = userRow
-              ? (customersByUserId.get(userRow.id)?.id ?? placeholders.customerId)
-              : placeholders.customerId;
-
             const sessionList = await withRetry(
               () => stripe.checkout.sessions.list({ payment_intent: staged.stripePaymentIntentId, limit: 1 }),
               8,
@@ -784,11 +797,116 @@ registerRoute({
             );
             const session = sessionList.data[0] ?? null;
             const sessionWithShipping = session as (Stripe.Checkout.Session & {
+              shipping_details?: { name?: string | null; address?: Stripe.Address | null };
+            }) | null;
+
+            const sessionCustomerEmail = session?.customer_details?.email ?? null;
+            const candidateEmail = sessionCustomerEmail ?? staged.billingEmail ?? null;
+            const candidateName = sessionWithShipping?.shipping_details?.name
+              ?? session?.customer_details?.name
+              ?? null;
+            const parsedName = splitFullName(candidateName);
+
+            let userRow =
+              (staged.stripeCustomerId ? usersByStripeCustomerId.get(staged.stripeCustomerId) : undefined)
+              ?? (candidateEmail ? usersByEmail.get(candidateEmail) : undefined)
+              ?? undefined;
+
+            if (!userRow && candidateEmail) {
+              const existingByEmail = (
+                await db
+                  .select()
+                  .from(users)
+                  .where(eq(users.email, candidateEmail))
+              )[0];
+
+              if (existingByEmail) {
+                userRow = existingByEmail;
+                usersByEmail.set(existingByEmail.email, existingByEmail);
+                if (existingByEmail.stripeCustomerId) {
+                  usersByStripeCustomerId.set(existingByEmail.stripeCustomerId, existingByEmail);
+                }
+              } else {
+                const insertedUser = (
+                  await db
+                    .insert(users)
+                    .values({
+                      id: crypto.randomUUID(),
+                      email: candidateEmail,
+                      passwordHash: '',
+                      role: 'customer',
+                      stripeCustomerId: staged.stripeCustomerId ?? null,
+                    })
+                    .returning()
+                )[0];
+                userRow = insertedUser;
+                usersByEmail.set(insertedUser.email, insertedUser);
+                if (insertedUser.stripeCustomerId) {
+                  usersByStripeCustomerId.set(insertedUser.stripeCustomerId, insertedUser);
+                }
+              }
+            }
+
+            if (userRow && staged.stripeCustomerId && !userRow.stripeCustomerId) {
+              const updatedUser = (
+                await db
+                  .update(users)
+                  .set({ stripeCustomerId: staged.stripeCustomerId })
+                  .where(eq(users.id, userRow.id))
+                  .returning()
+              )[0];
+              userRow = updatedUser;
+              usersByEmail.set(updatedUser.email, updatedUser);
+              if (updatedUser.stripeCustomerId) {
+                usersByStripeCustomerId.set(updatedUser.stripeCustomerId, updatedUser);
+              }
+            }
+
+            let customerRow = userRow ? customersByUserId.get(userRow.id) : undefined;
+            if (userRow && !customerRow) {
+              const firstName = parsedName?.firstName ?? candidateEmail ?? 'Guest';
+              const lastName = parsedName?.lastName ?? '-';
+              const insertedCustomer = (
+                await db
+                  .insert(customers)
+                  .values({
+                    id: crypto.randomUUID(),
+                    userId: userRow.id,
+                    firstName,
+                    lastName,
+                    phone: null,
+                  })
+                  .returning()
+              )[0];
+              customerRow = insertedCustomer;
+              customersByUserId.set(userRow.id, insertedCustomer);
+            }
+
+            if (
+              userRow
+              && customerRow
+              && parsedName
+              && hasLowQualityCustomerName(customerRow.firstName, customerRow.lastName, userRow.email)
+            ) {
+              const updatedCustomer = (
+                await db
+                  .update(customers)
+                  .set({ firstName: parsedName.firstName, lastName: parsedName.lastName })
+                  .where(eq(customers.id, customerRow.id))
+                  .returning()
+              )[0];
+              customerRow = updatedCustomer;
+              customersByUserId.set(userRow.id, updatedCustomer);
+            }
+
+            const customerId = customerRow?.id ?? placeholders.customerId;
+
+            const sessionWithAddress = session as (Stripe.Checkout.Session & {
               shipping_details?: { address?: Stripe.Address | null };
             }) | null;
 
             const stripeAddress =
-              sessionWithShipping?.shipping_details?.address
+              sessionWithAddress?.shipping_details?.address
               ?? session?.customer_details?.address
               ?? null;
 
@@ -853,8 +971,8 @@ registerRoute({
                         ?,
                         ?,
                         ?,
-                        datetime('now'),
-                        datetime('now')
+                        ?,
+                        ?
                       )
                       ON CONFLICT(stripe_payment_intent_id) DO NOTHING`,
                 args: [
@@ -869,6 +987,8 @@ registerRoute({
                   staged.stripePaymentIntentId,
                   resolvedAddressId,
                   resolvedAddressId,
+                  staged.createdAt,
+                  staged.createdAt,
                 ],
               }),
               20,

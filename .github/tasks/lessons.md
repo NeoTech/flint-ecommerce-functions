@@ -57,3 +57,13 @@ Trying to `DELETE FROM users` or `DELETE FROM customers` fails silently or throw
 **Lesson:** Broad refactors across working sync paths caused repeated regressions and made debugging harder.
 
 **Rule:** For recurring production bugs, implement in minimal slices: first add deterministic verification, then apply one narrowly scoped fix at a time with no unrelated behavior changes. Validate after each slice before touching another area.
+
+## Stripe import reset/resync runbook (production)
+
+**Lesson:** A full `finalize` call with larger `batchSize` can intermittently fail with `INTERNAL_ERROR` on production-scale backfills, leaving rows in `processing`/`failed` states even when stage succeeded.
+
+**Rule:** For production resyncs, use a two-step recovery-safe flow:
+1. Selectively reset only Stripe-import artifacts (`orders WHERE source='stripe'`, staging rows, `sync_cursors` row, synthetic `processed_webhook_events` entries).
+2. Run `phase=stage` once.
+3. If `phase=finalize&batchSize=10` fails, immediately fall back to draining with `batchSize=1` in a loop and clear stale claims (`status='processing'` -> releasable) before retrying.
+4. Verify completion with `phase=status` (`remainingToFinalize=0`) and query imported order dates to confirm historical timestamps are preserved.

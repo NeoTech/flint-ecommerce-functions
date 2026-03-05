@@ -605,3 +605,42 @@ This keeps imports deterministic, retry-safe, and resumable across multiple requ
 - [x] Admin-sync finalize writes a `processed_webhook_events` row to block duplicate webhook fulfillment
 - [x] Running full sync twice from clean state produces byte-identical DB snapshots
 - [x] All existing tests pass; new test file has 9+ test cases; zero failures
+
+---
+
+## LOPC-22: Wire Stripe refund API into POST /orders/:id/refund
+
+**Goal:** The existing `/orders/:id/refund` endpoint only updated the local DB. Wire it to call `stripe.refunds.create()` so real money is returned to the customer when the order originated on Stripe.
+
+**Scope:**
+- `POST /orders/:id/refund`: if `order.stripePaymentIntentId` is set, call `stripe.refunds.create({ payment_intent, amount_in_cents })` before updating local DB. On Stripe failure return 500 without touching local state. API-created orders (no PI) skip Stripe silently.
+- Response now includes `stripeRefundId` (`re_...` or `null`).
+- 3 new tests: API order (no Stripe call), Stripe-originated order (verifies `refunds.create` called with cents), Stripe failure returns 500 and local DB unchanged.
+- Docs updated: `docs/api/orders.md`, `llms.txt`.
+
+- [x] LOPC-22-1: Import `getStripe` into `orders.ts`; add `serverError` to imports
+- [x] LOPC-22-2: Refund handler calls `stripe.refunds.create()` when `stripePaymentIntentId` is set; converts dollars → cents; returns `stripeRefundId` in response
+- [x] LOPC-22-3: Three new tests added to `orders.test.ts` (mock via `mock.module`)
+- [x] LOPC-22-4: `docs/api/orders.md` updated — Stripe behaviour, response shape, error table
+- [x] LOPC-22-5: `llms.txt` orders endpoint table updated
+- [x] LOPC-22-6: 175 tests pass, 0 fail; deployed to production
+
+---
+
+## LOPC-23: Preserve Stripe transaction dates on imported orders
+
+**Goal:** Imported historical orders must keep their original Stripe transaction timestamp, not the import runtime timestamp.
+
+**Scope:**
+- Stage step writes `stripe_order_import_staging.created_at` from `charge.created` (`datetime(unixepoch)`).
+- Finalize step writes `orders.created_at` and `orders.updated_at` from staged transaction timestamp.
+- Added regression test: finalize creates order with `createdAt = 2024-01-15 12:00:00` for fixed fixture epoch.
+- Updated docs: `docs/api/admin.md`, `llms.txt`.
+
+- [x] LOPC-23-1: Stage insert uses Stripe `charge.created` instead of `datetime('now')`
+- [x] LOPC-23-2: Upsert preserves created_at for finalized rows; refreshes for non-finalized rows
+- [x] LOPC-23-3: Finalize inserts order timestamps from staged transaction time
+- [x] LOPC-23-4: Added regression test in `src/api/stripe-sync.test.ts`
+- [x] LOPC-23-5: Updated affected Stripe charge fixtures in `stripe-sync.test.ts` and `stripe.test.ts`
+- [x] LOPC-23-6: Full test suite passes (`176 pass / 0 fail / 3 skip`)
+- [x] LOPC-23-7: Deployed to Cloudflare Workers (`Version ID: b4607889-01f5-4303-a0ac-9107e2630055`)

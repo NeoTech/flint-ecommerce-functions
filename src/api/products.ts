@@ -16,6 +16,7 @@ import { registerRoute } from '../router.js';
 import { getDb } from '../db/client.js';
 import { productVariants, products } from '../db/schema.js';
 import { getStripe } from '../lib/stripe.js';
+import { validateBearerToken } from '../middleware/auth.js';
 import {
   badRequest,
   conflict,
@@ -98,7 +99,8 @@ registerRoute({
     const { page, pageSize, offset } = parsePagination(url);
     const db = getDb(ctx.env);
 
-    const isAdmin = ctx.role === 'admin';
+    const auth = await validateBearerToken(request, ctx.env);
+    const isAdmin = auth?.role === 'admin';
     const categoryFilter = url.searchParams.get('category');
     const minPrice      = url.searchParams.get('minPrice');
     const maxPrice      = url.searchParams.get('maxPrice');

@@ -135,7 +135,7 @@ List endpoints accept `page` (default `1`) and `pageSize` (default `20`) query p
 | POST | `/orders` | customer | Create order. Body: `lines[]` (`productId`, `variantId?`, `quantity`), `shippingAddressId`, `notes?`. Stock decremented atomically. |
 | PUT | `/orders/:id/status` | admin | Advance order status. Valid transitions: `pending→confirmed/cancelled`, `confirmed→processing/cancelled`, `processing→shipped/cancelled`, `shipped→delivered`, `delivered→refunded`. |
 | DELETE | `/orders/:id` | customer | Cancel order. Admins cancel any `pending/confirmed/processing` order; customers cancel their own `pending` orders within 30 minutes. Stock restored atomically. |
-| POST | `/orders/:id/refund` | admin | Apply partial or full refund. Body: `amount`, `reason`. When `refundedAmount >= subtotal` status becomes `refunded`. |
+| POST | `/orders/:id/refund` | admin | Issue partial or full refund. Body: `amount`, `reason`. Calls `stripe.refunds.create()` if the order has a `stripePaymentIntentId`; otherwise records locally only. Returns updated order plus `stripeRefundId` (`null` for non-Stripe orders). |
 
 ### Logistics
 
@@ -173,10 +173,15 @@ List endpoints accept `page` (default `1`) and `pageSize` (default `20`) query p
 ## Key Behaviours
 
 - **Stock management**: decremented atomically on order creation; restored on cancellation.
-- **Stripe sync**: products and customers are synced bidirectionally via `POST /admin/sync/stripe`. Stripe product/price IDs are stored on local rows after first sync. The `catalog` phase syncs products and customers only. The `stage` phase imports historical charges with a DB-persisted cursor. The `finalize` phase converts staged rows to orders in bounded batches controlled by `batchSize`. Response includes `controls.cursorPersisted` (boolean), product counters `archived` / `importedArchived` for Stripe-archived products, and `backlog.staleProcessing` for lease-expired rows that will be auto-reclaimed. `remainingToFinalize` = `pending + failed + staleProcessing`.
+- **Stripe sync**: products and customers are synced bidirectionally via `POST /admin/sync/stripe`. Stripe product/price IDs are stored on local rows after first sync. The `catalog` phase syncs products and customers only. The `stage` phase imports historical charges with a DB-persisted cursor. The `finalize` phase converts staged rows to orders in bounded batches controlled by `batchSize`. Imported order timestamps are preserved from Stripe transaction time (`charge.created`) rather than import time. Response includes `controls.cursorPersisted` (boolean), product counters `archived` / `importedArchived` for Stripe-archived products, and `backlog.staleProcessing` for lease-expired rows that will be auto-reclaimed. `remainingToFinalize` = `pending + failed + staleProcessing`.
+- **Customer identity during finalize**: when checkout identity maps to a local user that lacks a `customers` row, finalize creates one; if an existing customer has low-quality placeholder/email-style names, finalize backfills first/last name from Stripe checkout data when available.
 - **Webhook gating**: when a payment intent exists in `stripe_order_import_staging` with status `pending` or `processing`, webhook fulfillment is deferred to avoid race conditions with admin sync.
 - **Webhook idempotency**: every Stripe event is recorded in `processed_webhook_events`. Duplicate deliveries are silently ignored.
 - **Order source**: `source` field is `api` for orders created through the API and `stripe_import` for orders imported from historical Stripe charges.
 - **Soft delete**: products are archived (`status → archived`), not hard-deleted.
 - **JWT rotation**: refresh tokens are single-use and rotated on every `/auth/refresh` call.
 - **Placeholder address**: a system sentinel (`id = 00000000-0000-0000-0000-00000000a003`) exists for imported orders with no resolvable address.
+
+### Operator instruction (name repair resync)
+
+If historical Stripe-imported orders contain placeholder customer names, run a one-time targeted resync: delete only `source='stripe'` orders + staging/cursor/synthetic admin-sync webhook artifacts, run `phase=stage`, then loop `phase=finalize` until `remainingToFinalize=0` (fallback to `batchSize=1` if large batches fail).

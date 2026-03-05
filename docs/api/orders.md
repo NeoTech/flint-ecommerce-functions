@@ -196,7 +196,11 @@ No content.
 
 ## POST /orders/:id/refund
 
-Apply a (partial or full) refund amount to a delivered or already-partially-refunded order. When `refundedAmount >= subtotal`, the order status automatically becomes `refunded`. Admin only.
+Issue a partial or full refund on an order. Admin only.
+
+- If the order has a `stripePaymentIntentId` (i.e. it originated from Stripe), the refund is issued on Stripe first via `stripe.refunds.create()`. The local DB is only updated on Stripe success. If Stripe rejects the refund, `500` is returned and the local state is unchanged.
+- If the order is API-created (no payment intent), the refund is recorded locally only.
+- When `refundedAmount >= subtotal`, the order status automatically becomes `refunded`.
 
 **Auth:** `admin`
 
@@ -210,12 +214,27 @@ Apply a (partial or full) refund amount to a delivered or already-partially-refu
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `amount` | `number` | Yes | Refund amount, must be positive |
-| `reason` | `string` | Yes | Reason for the refund |
+| `amount` | `number` | Yes | Refund amount in store currency (e.g. `25.00`). Converted to cents when calling Stripe. |
+| `reason` | `string` | Yes | Reason for the refund (free text, stored locally only) |
 
 ### Response `200`
 
-Updated order object with new `refundedAmount` and potentially updated `status`.
+Updated order object plus `stripeRefundId`.
+
+```json
+{
+  "data": {
+    "id": "uuid",
+    "status": "refunded",
+    "refundedAmount": 50.00,
+    "stripeRefundId": "re_3abc123..."
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `stripeRefundId` | Stripe Refund ID (`re_...`), or `null` for API-created orders |
 
 ### Error Responses
 
@@ -223,3 +242,4 @@ Updated order object with new `refundedAmount` and potentially updated `status`.
 |---|---|---|
 | 404 | `NOT_FOUND` | Order not found |
 | 422 | `VALIDATION_ERROR` | Order not in `delivered` or `refunded` status |
+| 500 | `SERVER_ERROR` | Stripe rejected the refund (message included) |

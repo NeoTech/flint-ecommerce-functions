@@ -183,11 +183,12 @@ function syncRequest(phase: string, extra = '') {
 }
 
 /** Set up the mock so charges.list returns a single charge */
-function mockSingleCharge(piId = 'pi_test001', chargeId = 'ch_test001') {
+function mockSingleCharge(piId = 'pi_test001', chargeId = 'ch_test001', created = 1705320000) {
   mockChargesList.mockImplementationOnce(async () => ({
     data: [{
       id: chargeId,
       status: 'succeeded',
+      created,
       payment_intent: piId,
       customer: null,
       billing_details: { email: 'test@example.com' },
@@ -403,6 +404,150 @@ describe('Finalize correctness', () => {
     const orderRows = await db.select().from(orders)
       .where(eq(orders.stripePaymentIntentId, 'pi_no_lines'));
     expect(orderRows.length).toBe(0);
+  });
+
+  it('(j) imported order keeps original Stripe transaction date', async () => {
+    const hdrs = await adminHeaders();
+    await seedProduct('sp_txn_date');
+
+    // 2024-01-15 12:00:00 UTC
+    const chargeCreatedUnix = 1705320000;
+    mockSingleCharge('pi_txn_date', 'ch_txn_date', chargeCreatedUnix);
+    mockSessionForPI('pi_txn_date', 'cs_txn_date');
+    mockLineItemsForProduct('sp_txn_date');
+
+    const stageRes = await dispatch(
+      new Request(`${BASE}/admin/sync/stripe?phase=stage`, { method: 'POST', headers: hdrs }),
+      env,
+    );
+    expect(stageRes.status).toBe(200);
+
+    const finalizeRes = await dispatch(
+      new Request(`${BASE}/admin/sync/stripe?phase=finalize&batchSize=5`, { method: 'POST', headers: hdrs }),
+      env,
+    );
+    expect(finalizeRes.status).toBe(200);
+
+    const imported = await db.select().from(orders)
+      .where(eq(orders.stripePaymentIntentId, 'pi_txn_date'));
+    expect(imported.length).toBe(1);
+
+    // SQLite datetime('unixepoch') format: YYYY-MM-DD HH:MM:SS
+    expect(imported[0]?.createdAt).toBe('2024-01-15 12:00:00');
+    expect(imported[0]?.updatedAt).toBe('2024-01-15 12:00:00');
+  });
+
+  it('(k) finalize creates missing customer profile and uses session name', async () => {
+    const hdrs = await adminHeaders();
+    await seedProduct('sp_missing_customer_profile');
+
+    await db.insert(users).values({
+      id: 'admin-no-customer',
+      email: 'admin-nocustomer@example.com',
+      passwordHash: '',
+      role: 'admin',
+      stripeCustomerId: 'cus_admin_nocustomer',
+    });
+
+    await db.insert(stripeOrderImportStaging).values({
+      id: crypto.randomUUID(),
+      stripePaymentIntentId: 'pi_missing_customer_profile',
+      stripeChargeId: 'ch_missing_customer_profile',
+      stripeCustomerId: 'cus_admin_nocustomer',
+      billingEmail: 'admin-nocustomer@example.com',
+      amount: 19.99,
+      amountRefunded: 0,
+      refunded: 0,
+      status: 'pending',
+      attempts: 0,
+    });
+
+    mockCheckoutSessionsList.mockImplementationOnce(async () => ({
+      data: [{
+        id: 'cs_missing_customer_profile',
+        payment_intent: 'pi_missing_customer_profile',
+        customer: 'cus_admin_nocustomer',
+        customer_details: { email: 'admin-nocustomer@example.com', name: 'Andreas Pettersson', address: null },
+        shipping_details: null,
+        amount_total: 1999,
+      }],
+      has_more: false,
+    }));
+    mockLineItemsForProduct('sp_missing_customer_profile');
+
+    const res = await dispatch(
+      new Request(`${BASE}/admin/sync/stripe?phase=finalize&batchSize=5`, { method: 'POST', headers: hdrs }),
+      env,
+    );
+    expect(res.status).toBe(200);
+
+    const orderRows = await db.select().from(orders)
+      .where(eq(orders.stripePaymentIntentId, 'pi_missing_customer_profile'));
+    expect(orderRows.length).toBe(1);
+    expect(orderRows[0]?.customerId).not.toBe('00000000-0000-0000-0000-00000000a002');
+
+    const createdCustomer = await db.select().from(customers)
+      .where(eq(customers.userId, 'admin-no-customer'));
+    expect(createdCustomer.length).toBe(1);
+    expect(createdCustomer[0]?.firstName).toBe('Andreas');
+    expect(createdCustomer[0]?.lastName).toBe('Pettersson');
+  });
+
+  it('(l) finalize backfills low-quality customer names from session name', async () => {
+    const hdrs = await adminHeaders();
+    await seedProduct('sp_backfill_customer_name');
+
+    await db.insert(users).values({
+      id: 'user-backfill-name',
+      email: 'none@all.com',
+      passwordHash: '',
+      role: 'customer',
+      stripeCustomerId: 'cus_backfill_name',
+    });
+    await db.insert(customers).values({
+      id: 'customer-backfill-name',
+      userId: 'user-backfill-name',
+      firstName: 'none@all.com',
+      lastName: '-',
+      phone: null,
+    });
+
+    await db.insert(stripeOrderImportStaging).values({
+      id: crypto.randomUUID(),
+      stripePaymentIntentId: 'pi_backfill_customer_name',
+      stripeChargeId: 'ch_backfill_customer_name',
+      stripeCustomerId: 'cus_backfill_name',
+      billingEmail: 'none@all.com',
+      amount: 29.99,
+      amountRefunded: 0,
+      refunded: 0,
+      status: 'pending',
+      attempts: 0,
+    });
+
+    mockCheckoutSessionsList.mockImplementationOnce(async () => ({
+      data: [{
+        id: 'cs_backfill_customer_name',
+        payment_intent: 'pi_backfill_customer_name',
+        customer: 'cus_backfill_name',
+        customer_details: { email: 'none@all.com', name: 'Balle Ballesson', address: null },
+        shipping_details: null,
+        amount_total: 2999,
+      }],
+      has_more: false,
+    }));
+    mockLineItemsForProduct('sp_backfill_customer_name');
+
+    const res = await dispatch(
+      new Request(`${BASE}/admin/sync/stripe?phase=finalize&batchSize=5`, { method: 'POST', headers: hdrs }),
+      env,
+    );
+    expect(res.status).toBe(200);
+
+    const updatedCustomer = await db.select().from(customers)
+      .where(eq(customers.id, 'customer-backfill-name'));
+    expect(updatedCustomer[0]?.firstName).toBe('Balle');
+    expect(updatedCustomer[0]?.lastName).toBe('Ballesson');
   });
 
   // ---------------------------------------------------------------------------
@@ -659,6 +804,7 @@ describe('Full sync replay', () => {
     const chargeFixture = {
       id: 'ch_replay001',
       status: 'succeeded',
+      created: 1705320000,
       payment_intent: 'pi_replay001',
       customer: null,
       billing_details: { email: 'replay@example.com' },
