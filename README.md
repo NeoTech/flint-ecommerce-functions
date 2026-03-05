@@ -244,3 +244,8 @@ E2E=1 bun test test/e2e/          # end-to-end (requires running server)
 Add GitHub Actions secrets for automated deployment:
 - `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` — for `bun run deploy:cf`
 - `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID` — for `bun run deploy:vercel`
+
+## DASHBOARD
+
+A seperate dashboard frontend is developed in [neotech/universal-dashboard](https://github.com/neotech/universal-dashboard). It connects to this API for all data operations. The dashboard is built with HTMX, SolidJS and TypeScript. It packs and run in a single container with NGROK+Traefik.
+![universal-dashboard](universal-dashboard.png)
